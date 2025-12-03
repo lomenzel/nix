@@ -1,3 +1,7 @@
+#include "nix/expr/attr-set.hh"
+#include "nix/expr/nixexpr.hh"
+#include "nix/expr/symbol-table.hh"
+#include "nix/expr/value.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
@@ -21,6 +25,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <map>
 #include <nlohmann/json.hpp>
 
 #include <sys/types.h>
@@ -3687,6 +3692,300 @@ static RegisterPrimOp primop_map({
       evaluates to `[ "foobar" "foobla" "fooabc" ]`.
     )",
     .fun = prim_map,
+});
+static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr);
+
+BindingsBuilder reifyParams(EvalState & state, std::optional<Formals> params, Symbol identifier)
+{
+
+    if (params) {
+
+        auto params_attrSet = state.buildBindings(3);
+
+        params_attrSet.alloc("ellipsis").mkBool(params->ellipsis);
+        ListBuilder namedParamsList = state.buildList(params->formals.size());
+
+        for (const auto & [i, v] : enumerate(namedParamsList)) {
+            Formal formal = (params->formals)[i];
+            BindingsBuilder paramAttrSet = state.buildBindings(formal.def ? 3 : 1);
+
+            paramAttrSet.alloc("name").mkString(state.symbols[formal.name], state.mem);
+
+            if (formal.def) {
+                auto b = appendBindingExpr(state, formal.def);
+                paramAttrSet.alloc("defaultExpr").mkAttrs(b);
+            }
+            (v = state.allocValue())->mkAttrs(paramAttrSet);
+        }
+        params_attrSet.alloc("formals").mkList(namedParamsList);
+
+        // Use the @-pattern argument (fn.fun->arg) for the params.id value. This
+        // corresponds to the identifier provided after the formals (e.g. `{...}@inputs`).
+        if (identifier)
+            params_attrSet.alloc("identifier").mkString(state.symbols[identifier], state.mem);
+        else
+            params_attrSet.alloc("identifier").mkNull();
+
+        return params_attrSet;
+    }
+    auto params_attrSet = state.buildBindings(1);
+    params_attrSet.alloc("name").mkString(state.symbols[identifier], state.mem);
+    return params_attrSet;
+}
+
+BindingsBuilder reifyAttrs(EvalState & state, ExprAttrs * eAttrs)
+{
+    BindingsBuilder b = state.buildBindings(4);
+    b.alloc("tag").mkString("attrSet", state.mem);
+
+    b.alloc("recursive").mkBool(eAttrs->recursive);
+
+    if (eAttrs->attrs) {
+        ExprAttrs::AttrDefs attrs = *(eAttrs->attrs);
+
+        BindingsBuilder attrsSet = state.buildBindings(attrs.size());
+
+        for (auto & kv : attrs) {
+            BindingsBuilder attrValue = appendBindingExpr(state, kv.second.e);
+            attrsSet.alloc(state.symbols[kv.first]).mkAttrs(attrValue);
+        }
+        b.alloc("attrs").mkAttrs(attrsSet);
+    }
+    if (eAttrs->dynamicAttrs) {
+        ExprAttrs::DynamicAttrDefs attrs = *(eAttrs->dynamicAttrs);
+        ListBuilder list = state.buildList(attrs.size());
+        for (const auto & [i, v] : enumerate(list)) {
+            BindingsBuilder name = appendBindingExpr(state, attrs[i].nameExpr);
+            BindingsBuilder value = appendBindingExpr(state, attrs[i].valueExpr);
+            BindingsBuilder attr = state.buildBindings(2);
+            attr.alloc("name").mkAttrs(name);
+            attr.alloc("value").mkAttrs(value);
+            (v = state.allocValue())->mkAttrs(attr);
+        }
+        b.alloc("dynamicAttrs").mkList(list);
+    }
+
+    return b;
+}
+
+/* helper to recursively convert expressions to attr sets describing its syntax. used by reify */
+static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr)
+{
+    if (ExprInt * eInt = dynamic_cast<ExprInt *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("literal", state.mem);
+        b.alloc("value").mkInt(eInt->v.integer());
+        return b;
+    } else if (ExprString * eStr = dynamic_cast<ExprString *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("literal", state.mem);
+        b.alloc("value").mkString(eStr->v.string_view(), state.mem);
+        return b;
+    } else if (ExprVar * eVar = dynamic_cast<ExprVar *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("var", state.mem);
+        b.alloc("name").mkString(state.symbols[eVar->name], state.mem);
+        return b;
+    } else if (ExprConcatStrings * eConcatStrings = dynamic_cast<ExprConcatStrings *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("concatString/addition", state.mem);
+        ListBuilder l = state.buildList(eConcatStrings->es.size());
+        for (const auto & [i, v] : enumerate(l)) {
+            auto lb = appendBindingExpr(state, eConcatStrings->es[i].second);
+            (v = state.allocValue())->mkAttrs(lb);
+        }
+        b.alloc("value").mkList(l);
+        return b;
+    } else if (ExprList * eList = dynamic_cast<ExprList *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("list", state.mem);
+        ListBuilder l = state.buildList(eList->elems.size());
+        for (const auto & [i, v] : enumerate(l)) {
+            auto lb = appendBindingExpr(state, eList->elems[i]);
+            (v = state.allocValue())->mkAttrs(lb);
+        }
+        b.alloc("value").mkList(l);
+        return b;
+    } else if (ExprLambda * eLambda = dynamic_cast<ExprLambda *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("lambda", state.mem);
+
+        BindingsBuilder value = state.buildBindings(2);
+
+        BindingsBuilder arguments = reifyParams(state, eLambda->getFormals(), eLambda->arg);
+        value.alloc("arguments").mkAttrs(arguments);
+
+        BindingsBuilder body = appendBindingExpr(state, eLambda->body);
+        value.alloc("body").mkAttrs(body);
+
+        b.alloc("value").mkAttrs(value);
+        return b;
+    } else if (ExprAttrs * eAttrs = dynamic_cast<ExprAttrs *>(expr)) {
+        return reifyAttrs(state, eAttrs);
+    } else if (ExprSelect * eSelect = dynamic_cast<ExprSelect *>(expr)) {
+        BindingsBuilder b = state.buildBindings(eSelect->def ? 4 : 3);
+        b.alloc("tag").mkString("select", state.mem);
+
+        std::span<const AttrName> path = eSelect->getAttrPath();
+
+        ListBuilder list = state.buildList(path.size());
+
+        for (const auto & [i, v] : enumerate(list)) {
+            AttrName aName = path[i];
+            if (aName.expr) {
+                BindingsBuilder e = appendBindingExpr(state, aName.expr);
+                (v = state.allocValue())->mkAttrs(e);
+            } else {
+                BindingsBuilder pName = state.buildBindings(2);
+                pName.alloc("tag").mkString("attrName", state.mem);
+                pName.alloc("value").mkString(state.symbols[aName.symbol], state.mem);
+                (v = state.allocValue())->mkAttrs(pName);
+            }
+        }
+        b.alloc("path").mkList(list);
+
+        BindingsBuilder expr = appendBindingExpr(state, eSelect->e);
+
+        if (eSelect->def) {
+            BindingsBuilder def = appendBindingExpr(state, eSelect->def);
+            b.alloc("default").mkAttrs(def);
+        }
+
+        b.alloc("value").mkAttrs(expr);
+        return b;
+    } else if (ExprIf * eIf = dynamic_cast<ExprIf *>(expr)) {
+        BindingsBuilder b = state.buildBindings(4);
+        b.alloc("tag").mkString("if", state.mem);
+
+        BindingsBuilder cond = appendBindingExpr(state, eIf->cond);
+        b.alloc("condition").mkAttrs(cond);
+
+        BindingsBuilder then = appendBindingExpr(state, eIf->then);
+        b.alloc("then").mkAttrs(then);
+
+        BindingsBuilder else_ = appendBindingExpr(state, eIf->else_);
+        b.alloc("else").mkAttrs(else_);
+        return b;
+    } else if (ExprLet * eLet = dynamic_cast<ExprLet *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("let", state.mem);
+
+        BindingsBuilder value = state.buildBindings(2);
+
+        BindingsBuilder body = appendBindingExpr(state, eLet->body);
+        BindingsBuilder attrs = appendBindingExpr(state, eLet->attrs);
+
+        value.alloc("body").mkAttrs(body);
+        value.alloc("attrs").mkAttrs(attrs);
+
+        b.alloc("value").mkAttrs(value);
+        return b;
+    } else if (ExprWith * eWith = dynamic_cast<ExprWith *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("with", state.mem);
+
+        BindingsBuilder value = state.buildBindings(2);
+
+        BindingsBuilder attrs = appendBindingExpr(state, eWith->attrs);
+        BindingsBuilder body = appendBindingExpr(state, eWith->body);
+
+        value.alloc("attrs").mkAttrs(attrs);
+        value.alloc("body").mkAttrs(body);
+
+        b.alloc("value").mkAttrs(value);
+        return b;
+    } else if (ExprCall * eCall = dynamic_cast<ExprCall *>(expr)) {
+        BindingsBuilder b = state.buildBindings(2);
+        BindingsBuilder value = state.buildBindings(2);
+        b.alloc("tag").mkString("call", state.mem);
+
+        BindingsBuilder fun = appendBindingExpr(state, eCall->fun);
+;
+        if (eCall->args) {
+           ListBuilder list = state.buildList(eCall->args->size());
+
+            for (const auto & [i, v] : enumerate(list)) {
+
+                BindingsBuilder arg = appendBindingExpr(state, (*(eCall->args))[i]);
+                (v = state.allocValue())->mkAttrs(arg);
+            }
+            value.alloc("args").mkList(list);
+        } else {
+            ListBuilder list = state.buildList(0);
+            value.alloc("args").mkList(list);
+        }
+        value.alloc("function").mkAttrs(fun);
+
+        b.alloc("value").mkAttrs(value);
+        return b;
+    }
+
+    BindingsBuilder error = state.buildBindings(1);
+    error.alloc("error").mkString("Unsupported Expr", state.mem);
+    state.error<EvalError>("unsupported Expr for reify").atPos(expr->getPos()).debugThrow();
+    return error;
+}
+
+/* Return a data representation of a function. */
+static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value & v)
+{
+    state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.reify");
+
+    if (args[0]->isPrimOp()) {
+        BindingsBuilder b = state.buildBindings(2);
+        b.alloc("tag").mkString("primop", state.mem);
+        b.alloc("name").mkString(args[0]->primOp()->name, state.mem);
+        v.mkAttrs(b);
+        return;
+    }
+
+    detail::ValueBase::Lambda fn = args[0]->lambda();
+
+    std::optional<Formals> params = fn.fun->getFormals();
+
+    BindingsBuilder params_attrSet = reifyParams(state, params, fn.fun->arg);
+
+    Expr * body = fn.fun->body;
+
+    BindingsBuilder body_attrSet = appendBindingExpr(state, body);
+
+    BindingsBuilder retAttrSet = state.buildBindings(2);
+    retAttrSet.alloc("arguments").mkAttrs(params_attrSet);
+    retAttrSet.alloc("body").mkAttrs(body_attrSet);
+
+    v.mkAttrs(retAttrSet);
+}
+
+static RegisterPrimOp primop_reify({
+    .name = "reify",
+    .args = {"f"},
+    .doc = R"(
+      Returns a structured data representation of the function f. For
+      example,
+
+      ```nix
+      reify (x: "foo" + x)
+      ```
+
+      evaluates to `{
+        arguments = {
+            identifier = "x"
+        };
+        body = {
+            tag = "stringConcat/addition";
+            value = [{
+                tag = "literal";
+                value ="foo";
+            }
+            {
+                tag = "var"
+                name = "x"
+            }];
+        };
+        closureEnv = {};
+      }`.
+    )",
+    .fun = prim_reify,
 });
 
 /* Filter a list using a predicate; that is, return a list containing
