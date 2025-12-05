@@ -4058,9 +4058,13 @@ static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value
 
     BindingsBuilder body_attrSet = appendBindingExpr(state, body, env, 1);
 
+    BindingsBuilder value = state.buildBindings(2);
+    value.alloc("arguments").mkAttrs(params_attrSet);
+    value.alloc("body").mkAttrs(body_attrSet);
+
     BindingsBuilder retAttrSet = state.buildBindings(2);
-    retAttrSet.alloc("arguments").mkAttrs(params_attrSet);
-    retAttrSet.alloc("body").mkAttrs(body_attrSet);
+    retAttrSet.alloc("tag").mkString("lambda", state.mem);
+    retAttrSet.alloc("value").mkAttrs(value);
 
     v.mkAttrs(retAttrSet);
 }
