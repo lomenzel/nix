@@ -4100,7 +4100,17 @@ static RegisterPrimOp primop_reify({
 static void prim_sameFunction(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.reify");
-    state.forceFunction(*args[1], pos, "while evaluating the first argument passed to builtins.reify");
+    state.forceFunction(*args[1], pos, "while evaluating the second argument passed to builtins.reify");
+
+    if(args[0]->isPrimOp() && args[1]->isPrimOp()) {
+        v.mkBool(args[0]->primOp()->name == args[1]->primOp()->name);
+        return;
+    }
+
+    if (args[0]->isPrimOp() || args[1]->isPrimOp()) {
+        v.mkBool(false);
+        return;
+    }
 
     v.mkBool(args[0]->lambda().env == args[1]->lambda().env && args[0]->lambda().fun == args[1]->lambda().fun);
 }
