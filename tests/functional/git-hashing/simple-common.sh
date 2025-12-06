@@ -47,14 +47,14 @@ try2 () {
     hashFromGit=$(git -C "$repo" rev-parse "HEAD:$hashPath")
     [[ "$hashFromGit" == "$expected" ]]
 
-    nix path-info --json "$path" | jq -e \
+    nix path-info --json --json-format 2 "$path" | jq -e \
         --arg algo "$hashAlgo" \
-        --arg hash "$(nix hash convert --to base64 "$hashAlgo:$hashFromGit")" \
-        '.[].ca == {
+        --arg hash "$hashFromGit" \
+        '.info.[].ca == {
             method: "git",
             hash: {
                 algorithm: $algo,
-                format: "base64",
+                format: "base16",
                 hash: $hash
             },
         }'
