@@ -3772,7 +3772,7 @@ reifyParams(EvalState & state, std::optional<Formals> params, Symbol identifier,
         return params_attrSet;
     }
     auto params_attrSet = state.buildBindings(1);
-    params_attrSet.alloc("name").mkString(state.symbols[identifier], state.mem);
+    params_attrSet.alloc("identifier").mkString(state.symbols[identifier], state.mem);
     return params_attrSet;
 }
 
