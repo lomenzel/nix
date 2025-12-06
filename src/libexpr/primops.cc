@@ -4082,7 +4082,7 @@ static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value
     if (args[0]->isPrimOp()) {
         BindingsBuilder b = state.buildBindings(2);
         b.alloc("_expr").mkString("primop", state.mem);
-        b.alloc("name").mkString(args[0]->primOp()->name, state.mem);
+        b.alloc("value").mkString(args[0]->primOp()->name, state.mem);
         v.mkAttrs(b);
         return;
     }
