@@ -3892,7 +3892,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
                 (v = state.allocValue())->mkAttrs(e);
             } else {
                 BindingsBuilder pName = state.buildBindings(2);
-                pName.alloc("tag").mkString("attrName", state.mem);
+                pName.alloc("_expr").mkString("attrName", state.mem);
                 pName.alloc("value").mkString(state.symbols[aName.symbol], state.mem);
                 (v = state.allocValue())->mkAttrs(pName);
             }
@@ -4104,7 +4104,7 @@ static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value
     value.alloc("body").mkAttrs(body_attrSet);
 
     BindingsBuilder retAttrSet = state.buildBindings(2);
-    retAttrSet.alloc("tag").mkString("lambda", state.mem);
+    retAttrSet.alloc("_expr").mkString("lambda", state.mem);
     retAttrSet.alloc("value").mkAttrs(value);
 
     v.mkAttrs(retAttrSet);
