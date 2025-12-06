@@ -3776,13 +3776,13 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
 {
     BindingsBuilder b = state.buildBindings(2);
     if (ExprInt * eInt = dynamic_cast<ExprInt *>(expr)) {
-        b.alloc("tag").mkString("literal", state.mem);
+        b.alloc("_expr").mkString("literal", state.mem);
         b.alloc("value").mkInt(eInt->v.integer());
     } else if (ExprString * eStr = dynamic_cast<ExprString *>(expr)) {
-        b.alloc("tag").mkString("literal", state.mem);
+        b.alloc("_expr").mkString("literal", state.mem);
         b.alloc("value").mkString(eStr->v.string_view(), state.mem);
     } else if (ExprVar * eVar = dynamic_cast<ExprVar *>(expr)) {
-        b.alloc("tag").mkString("var", state.mem);
+        b.alloc("_expr").mkString("var", state.mem);
 
         if (eVar->level >= level) {
             BindingsBuilder value = state.buildBindings(2);
@@ -3804,7 +3804,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
             b.alloc("value").mkAttrs(value);
         }
     } else if (ExprConcatStrings * eConcatStrings = dynamic_cast<ExprConcatStrings *>(expr)) {
-        b.alloc("tag").mkString("concatString/addition", state.mem);
+        b.alloc("_expr").mkString("concatString/addition", state.mem);
         ListBuilder l = state.buildList(eConcatStrings->es.size());
         for (const auto & [i, v] : enumerate(l)) {
             auto lb = appendBindingExpr(state, eConcatStrings->es[i].second, env, level);
@@ -3812,7 +3812,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         }
         b.alloc("value").mkList(l);
     } else if (ExprList * eList = dynamic_cast<ExprList *>(expr)) {
-        b.alloc("tag").mkString("list", state.mem);
+        b.alloc("_expr").mkString("list", state.mem);
         ListBuilder l = state.buildList(eList->elems.size());
         for (const auto & [i, v] : enumerate(l)) {
             auto lb = appendBindingExpr(state, eList->elems[i], env, level);
@@ -3820,7 +3820,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         }
         b.alloc("value").mkList(l);
     } else if (ExprLambda * eLambda = dynamic_cast<ExprLambda *>(expr)) {
-        b.alloc("tag").mkString("lambda", state.mem);
+        b.alloc("_expr").mkString("lambda", state.mem);
 
         BindingsBuilder value = state.buildBindings(2);
 
@@ -3832,11 +3832,11 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
 
         b.alloc("value").mkAttrs(value);
     } else if (ExprAttrs * eAttrs = dynamic_cast<ExprAttrs *>(expr)) {
-        b.alloc("tag").mkString("attrSet", state.mem);
+        b.alloc("_expr").mkString("attrSet", state.mem);
         BindingsBuilder value = reifyAttrs(state, eAttrs, env, level);
         b.alloc("value").mkAttrs(value);
     } else if (ExprSelect * eSelect = dynamic_cast<ExprSelect *>(expr)) {
-        b.alloc("tag").mkString("select", state.mem);
+        b.alloc("_expr").mkString("select", state.mem);
 
         auto value = state.buildBindings(eSelect->def ? 3 : 2);
 
@@ -3868,7 +3868,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
 
         b.alloc("value").mkAttrs(value);
     } else if (ExprIf * eIf = dynamic_cast<ExprIf *>(expr)) {
-        b.alloc("tag").mkString("if", state.mem);
+        b.alloc("_expr").mkString("if", state.mem);
 
         BindingsBuilder value = state.buildBindings(3);
 
@@ -3882,7 +3882,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         value.alloc("else").mkAttrs(else_);
         b.alloc("value").mkAttrs(value);
     } else if (ExprLet * eLet = dynamic_cast<ExprLet *>(expr)) {
-        b.alloc("tag").mkString("let", state.mem);
+        b.alloc("_expr").mkString("let", state.mem);
 
         BindingsBuilder value = state.buildBindings(2);
 
@@ -3894,7 +3894,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
 
         b.alloc("value").mkAttrs(value);
     } else if (ExprWith * eWith = dynamic_cast<ExprWith *>(expr)) {
-        b.alloc("tag").mkString("with", state.mem);
+        b.alloc("_expr").mkString("with", state.mem);
 
         BindingsBuilder value = state.buildBindings(2);
 
@@ -3907,7 +3907,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
     } else if (ExprCall * eCall = dynamic_cast<ExprCall *>(expr)) {
         BindingsBuilder value = state.buildBindings(2);
-        b.alloc("tag").mkString("call", state.mem);
+        b.alloc("_expr").mkString("call", state.mem);
 
         BindingsBuilder fun = appendBindingExpr(state, eCall->fun, env, level);
         ;
@@ -3928,7 +3928,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
 
         b.alloc("value").mkAttrs(value);
     } else if (ExprOpUpdate * eOpUpdate = dynamic_cast<ExprOpUpdate *>(expr)) {
-        b.alloc("tag").mkString("update", state.mem);
+        b.alloc("_expr").mkString("update", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpUpdate->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpUpdate->e2, env, level);
@@ -3941,7 +3941,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
 
     } else if (ExprOpConcatLists * eOpConcatLists = dynamic_cast<ExprOpConcatLists *>(expr)) {
-        b.alloc("tag").mkString("concatLists", state.mem);
+        b.alloc("_expr").mkString("concatLists", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpConcatLists->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpConcatLists->e2, env, level);
@@ -3954,11 +3954,11 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
 
     } else if (ExprOpNot * eOpNot = dynamic_cast<ExprOpNot *>(expr)) {
-        b.alloc("tag").mkString("not", state.mem);
+        b.alloc("_expr").mkString("not", state.mem);
         BindingsBuilder e1 = appendBindingExpr(state, eOpNot->e, env, level);
         b.alloc("value").mkAttrs(e1);
     } else if (ExprOpEq * eOpEq = dynamic_cast<ExprOpEq *>(expr)) {
-        b.alloc("tag").mkString("equals", state.mem);
+        b.alloc("_expr").mkString("equals", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpEq->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpEq->e2, env, level);
@@ -3971,7 +3971,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
 
     } else if (ExprOpAnd * eOpAnd = dynamic_cast<ExprOpAnd *>(expr)) {
-        b.alloc("tag").mkString("and", state.mem);
+        b.alloc("_expr").mkString("and", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpAnd->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpAnd->e2, env, level);
@@ -3984,7 +3984,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
 
     } else if (ExprOpOr * eOpOr = dynamic_cast<ExprOpOr *>(expr)) {
-        b.alloc("tag").mkString("or", state.mem);
+        b.alloc("_expr").mkString("or", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpOr->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpOr->e2, env, level);
@@ -3997,7 +3997,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
 
     } else if (ExprOpImpl * eOpImpl = dynamic_cast<ExprOpImpl *>(expr)) {
-        b.alloc("tag").mkString("implies", state.mem);
+        b.alloc("_expr").mkString("implies", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpImpl->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpImpl->e2, env, level);
@@ -4010,7 +4010,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
         b.alloc("value").mkAttrs(value);
 
     } else if (ExprOpNEq * eOpNEq = dynamic_cast<ExprOpNEq *>(expr)) {
-        b.alloc("tag").mkString("notEquals", state.mem);
+        b.alloc("_expr").mkString("notEquals", state.mem);
 
         BindingsBuilder e1 = appendBindingExpr(state, eOpNEq->e1, env, level);
         BindingsBuilder e2 = appendBindingExpr(state, eOpNEq->e2, env, level);
@@ -4022,10 +4022,10 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
 
         b.alloc("value").mkAttrs(value);
     } else if (ExprPath * ePath = dynamic_cast<ExprPath *>(expr)) {
-        b.alloc("tag").mkString("path", state.mem);
+        b.alloc("_expr").mkString("path", state.mem);
         b.alloc("value").mkString(ePath->v.pathStrView(), state.mem);
     } else if (ExprFloat * eFloat = dynamic_cast<ExprFloat *>(expr)) {
-        b.alloc("tag").mkString("literal", state.mem);
+        b.alloc("_expr").mkString("literal", state.mem);
         b.alloc("value").mkFloat(eFloat->v.fpoint());
     } else {
         state.error<EvalError>("unsupported Expr for reify").atPos(expr->getPos()).debugThrow();
@@ -4040,7 +4040,7 @@ static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value
 
     if (args[0]->isPrimOp()) {
         BindingsBuilder b = state.buildBindings(2);
-        b.alloc("tag").mkString("primop", state.mem);
+        b.alloc("_expr").mkString("primop", state.mem);
         b.alloc("name").mkString(args[0]->primOp()->name, state.mem);
         v.mkAttrs(b);
         return;
