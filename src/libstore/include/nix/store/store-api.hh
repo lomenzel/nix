@@ -40,7 +40,8 @@ struct BasicDerivation;
 struct Derivation;
 
 struct SourceAccessor;
-class NarInfoDiskCache;
+struct NarInfoDiskCache;
+struct NarInfoDiskCacheSettings;
 class Store;
 
 typedef std::map<std::string, StorePath> OutputPathMap;
@@ -82,8 +83,8 @@ struct StoreConfigBase : Config
 private:
 
     /**
-     * An indirection so that we don't need to refer to global settings
-     * in headers.
+     * Compute the default Nix store directory from environment variables
+     * (`NIX_STORE_DIR`, `NIX_STORE`) or the compile-time default.
      */
     static Path getDefaultNixStoreDir();
 
@@ -219,6 +220,12 @@ struct StoreConfig : public StoreConfigBase, public StoreDirConfig
         false};
 
     /**
+     * Whether we're allowed to write to this store, also takes into account
+     * global `readOnly`'s mode setting, not just any per-store settings.
+     */
+    virtual bool getReadOnly() const;
+
+    /**
      * Open a store of the type corresponding to this configuration
      * type.
      */
@@ -294,7 +301,7 @@ protected:
          * Whether the value is valid as a cache entry. The path may not
          * exist.
          */
-        bool isKnownNow();
+        bool isKnownNow(const NarInfoDiskCacheSettings & settings);
 
         /**
          * Past tense, because a path can only be assumed to exists when
@@ -497,10 +504,7 @@ public:
     /**
      * Query which of the given paths have substitutes.
      */
-    virtual StorePathSet querySubstitutablePaths(const StorePathSet & paths)
-    {
-        return {};
-    };
+    virtual StorePathSet querySubstitutablePaths(const StorePathSet & paths);
 
     /**
      * Query substitute info (i.e. references, derivers and download
@@ -757,7 +761,7 @@ public:
      * Add signatures to the specified store path. The signatures are
      * not verified.
      */
-    virtual void addSignatures(const StorePath & storePath, const StringSet & sigs)
+    virtual void addSignatures(const StorePath & storePath, const std::set<Signature> & sigs)
     {
         unsupported("addSignatures");
     }
@@ -1006,9 +1010,6 @@ std::optional<ValidPathInfo>
 decodeValidPathInfo(const Store & store, std::istream & str, std::optional<HashResult> hashGiven = std::nullopt);
 
 const ContentAddress * getDerivationCA(const BasicDerivation & drv);
-
-std::map<DrvOutput, StorePath>
-drvOutputReferences(Store & store, const Derivation & drv, const StorePath & outputPath, Store * evalStore = nullptr);
 
 template<>
 struct json_avoids_null<TrustedFlag> : std::true_type

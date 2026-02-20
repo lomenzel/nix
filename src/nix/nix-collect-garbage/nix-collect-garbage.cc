@@ -1,5 +1,6 @@
 #include "nix/util/file-system.hh"
 #include "nix/util/signals.hh"
+#include "nix/util/error.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/store-cast.hh"
 #include "nix/store/gc-store.hh"
@@ -42,8 +43,8 @@ void removeOldGenerations(std::filesystem::path dir)
             std::string link;
             try {
                 link = readLink(path);
-            } catch (std::filesystem::filesystem_error & e) {
-                if (e.code() == std::errc::no_such_file_or_directory)
+            } catch (SystemError & e) {
+                if (e.is(std::errc::no_such_file_or_directory))
                     continue;
                 throw;
             }
@@ -87,25 +88,26 @@ static int main_nix_collect_garbage(int argc, char ** argv)
             return true;
         });
 
+        if (options.maxFreed != std::numeric_limits<uint64_t>::max() && dryRun)
+            throw UsageError("options --max-freed and --dry-run cannot be combined");
+
         if (removeOld) {
+            auto profilesDirOpts = settings.getProfileDirsOptions();
             std::set<std::filesystem::path> dirsToClean = {
-                profilesDir(),
+                profilesDir(profilesDirOpts),
                 std::filesystem::path{settings.nixStateDir} / "profiles",
-                getDefaultProfile().parent_path(),
+                getDefaultProfile(profilesDirOpts).parent_path(),
             };
             for (auto & dir : dirsToClean)
                 removeOldGenerations(dir);
         }
 
-        // Run the actual garbage collector.
-        if (!dryRun) {
-            auto store = openStore();
-            auto & gcStore = require<GcStore>(*store);
-            options.action = GCOptions::gcDeleteDead;
-            GCResults results;
-            PrintFreed freed(true, results);
-            gcStore.collectGarbage(options, results);
-        }
+        auto store = openStore();
+        auto & gcStore = require<GcStore>(*store);
+        options.action = dryRun ? GCOptions::gcReturnDead : GCOptions::gcDeleteDead;
+        GCResults results;
+        Finally printer([&] { printFreed(dryRun, results); });
+        gcStore.collectGarbage(options, results);
 
         return 0;
     }

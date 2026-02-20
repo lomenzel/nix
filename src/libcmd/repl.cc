@@ -12,9 +12,8 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/util/signals.hh"
-#include "nix/store/store-open.hh"
-#include "nix/store/log-store.hh"
 #include "nix/cmd/common-eval-args.hh"
+#include "nix/cmd/get-build-log.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/globals.hh"
@@ -65,7 +64,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
 
     const static int envSize = 32768;
     std::shared_ptr<StaticEnv> staticEnv;
-    Value lastLoaded;
+    std::optional<Value> lastLoaded;
     Env * env;
     int displ;
     StringSet varNames;
@@ -78,7 +77,6 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
 
     NixRepl(
         const LookupPath & lookupPath,
-        nix::ref<Store> store,
         ref<EvalState> state,
         std::function<AnnotatedValues()> getValues,
         RunNix * runNix);
@@ -133,7 +131,6 @@ std::string removeWhitespace(std::string s)
 
 NixRepl::NixRepl(
     const LookupPath & lookupPath,
-    nix::ref<Store> store,
     ref<EvalState> state,
     std::function<NixRepl::AnnotatedValues()> getValues,
     RunNix * runNix)
@@ -566,31 +563,9 @@ ProcessLineResult NixRepl::processLine(std::string line)
         } else if (command == ":log") {
             settings.readOnlyMode = true;
             Finally roModeReset([&]() { settings.readOnlyMode = false; });
-            auto subs = getDefaultSubstituters();
-
-            subs.push_front(state->store);
-
-            bool foundLog = false;
             RunPager pager;
-            for (auto & sub : subs) {
-                auto * logSubP = dynamic_cast<LogStore *>(&*sub);
-                if (!logSubP) {
-                    printInfo(
-                        "Skipped '%s' which does not support retrieving build logs", sub->config.getHumanReadableURI());
-                    continue;
-                }
-                auto & logSub = *logSubP;
-
-                auto log = logSub.getBuildLog(drvPath);
-                if (log) {
-                    printInfo("got build log for '%s' from '%s'", drvPathRaw, logSub.config.getHumanReadableURI());
-                    logger->writeToStdout(*log);
-                    foundLog = true;
-                    break;
-                }
-            }
-            if (!foundLog)
-                throw Error("build log of '%s' is not available", drvPathRaw);
+            auto log = fetchBuildLog(state->store, drvPath, drvPathRaw);
+            logger->writeToStdout(log);
         } else {
             runNix("nix-shell", {drvPathRaw});
         }
@@ -735,7 +710,7 @@ void NixRepl::loadFlake(const std::string & flakeRefS)
     try {
         cwd = std::filesystem::current_path();
     } catch (std::filesystem::filesystem_error & e) {
-        throw SysError("cannot determine current working directory");
+        throw SystemError(e.code(), "cannot determine current working directory");
     }
 
     auto flakeRef = parseFlakeRef(fetchSettings, flakeRefS, cwd.string(), true);
@@ -773,11 +748,19 @@ void NixRepl::initEnv()
 
 void NixRepl::showLastLoaded()
 {
-    RunPager pager;
+    if (!lastLoaded)
+        throw Error("nothing has been loaded yet");
 
-    for (auto & i : *lastLoaded.attrs()) {
-        std::string_view name = state->symbols[i.name];
-        logger->cout(name);
+    RunPager pager;
+    try {
+        for (auto & i : *lastLoaded->attrs()) {
+            std::string_view name = state->symbols[i.name];
+            logger->cout(name);
+        }
+    } catch (SystemError & e) {
+        /* Ignore broken pipes when the pager gets interrupted. */
+        if (!e.is(std::errc::broken_pipe))
+            throw;
     }
 }
 
@@ -795,7 +778,7 @@ void NixRepl::loadFiles()
     loadedFiles.clear();
 
     for (auto & i : old) {
-        notice("Loading '%1%'...", i);
+        notice("Loading %1%...", PathFmt(i));
         loadFile(i);
     }
 
@@ -900,13 +883,9 @@ void NixRepl::runNix(const std::string & program, const Strings & args, const st
 }
 
 std::unique_ptr<AbstractNixRepl> AbstractNixRepl::create(
-    const LookupPath & lookupPath,
-    nix::ref<Store> store,
-    ref<EvalState> state,
-    std::function<AnnotatedValues()> getValues,
-    RunNix * runNix)
+    const LookupPath & lookupPath, ref<EvalState> state, std::function<AnnotatedValues()> getValues, RunNix * runNix)
 {
-    return std::make_unique<NixRepl>(lookupPath, std::move(store), state, getValues, runNix);
+    return std::make_unique<NixRepl>(lookupPath, state, getValues, runNix);
 }
 
 ReplExitStatus AbstractNixRepl::runSimple(ref<EvalState> evalState, const ValMap & extraEnv)
@@ -919,7 +898,6 @@ ReplExitStatus AbstractNixRepl::runSimple(ref<EvalState> evalState, const ValMap
     // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDelete)
     auto repl = std::make_unique<NixRepl>(
         lookupPath,
-        openStore(),
         evalState,
         getValues,
         /*runNix=*/nullptr);

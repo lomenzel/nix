@@ -1,12 +1,12 @@
 {
   description = "The purely functional package manager";
 
-  inputs.nixpkgs.url = "https://channels.nixos.org/nixos-25.05/nixexprs.tar.xz";
+  inputs.nixpkgs.url = "https://channels.nixos.org/nixos-25.11/nixexprs.tar.xz";
 
   inputs.nixpkgs-regression.url = "github:NixOS/nixpkgs/215d4d0fd80ca5163643b03a33fde804a29cc1e2";
   inputs.nixpkgs-23-11.url = "github:NixOS/nixpkgs/a62e6edd6d5e1fa0329b8653c801147986f8d446";
   inputs.flake-compat = {
-    url = "github:edolstra/flake-compat";
+    url = "github:NixOS/flake-compat";
     flake = false;
   };
 
@@ -115,6 +115,9 @@
                     }
                     // lib.optionalAttrs (crossSystem == "x86_64-unknown-freebsd13") {
                       useLLVM = true;
+                    }
+                    // lib.optionalAttrs (crossSystem == "x86_64-w64-mingw32") {
+                      emulator = pkgs: "${pkgs.buildPackages.wineWow64Packages.stable_11}/bin/wine";
                     };
                 overlays = [
                   (overlayFor (pkgs: pkgs.${stdenv}))
@@ -369,6 +372,7 @@
           # TODO probably should be `nix-cli`
           nix = self.packages.${system}.nix-everything;
           nix-manual = nixpkgsFor.${system}.native.nixComponents2.nix-manual;
+          nix-manual-manpages-only = nixpkgsFor.${system}.native.nixComponents2.nix-manual-manpages-only;
           nix-internal-api-docs = nixpkgsFor.${system}.native.nixComponents2.nix-internal-api-docs;
           nix-external-api-docs = nixpkgsFor.${system}.native.nixComponents2.nix-external-api-docs;
         }
@@ -405,6 +409,8 @@
 
               "nix-cmd" = { };
 
+              "nix-nswrapper" = { };
+
               "nix-cli" = { };
 
               "nix-everything" = { };
@@ -414,10 +420,6 @@
               };
 
               "nix-json-schema-checks" = {
-                supportsCross = false;
-              };
-
-              "nix-kaitai-struct-checks" = {
                 supportsCross = false;
               };
 

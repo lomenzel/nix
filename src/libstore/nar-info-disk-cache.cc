@@ -58,15 +58,10 @@ create table if not exists LastPurge (
 
 )sql";
 
-class NarInfoDiskCacheImpl : public NarInfoDiskCache
+struct NarInfoDiskCacheImpl : NarInfoDiskCache
 {
-public:
-
     /* How often to purge expired entries from the cache. */
     const int purgeInterval = 24 * 3600;
-
-    /* How long to cache binary cache info (i.e. /nix-cache-info) */
-    const int cacheInfoTtl = 7 * 24 * 3600;
 
     struct Cache
     {
@@ -86,13 +81,17 @@ public:
 
     Sync<State> _state;
 
-    NarInfoDiskCacheImpl(Path dbPath = (getCacheDir() / "binary-cache-v7.sqlite").string())
+    NarInfoDiskCacheImpl(
+        const Settings & settings,
+        SQLiteSettings sqliteSettings,
+        Path dbPath = (getCacheDir() / "binary-cache-v7.sqlite").string())
+        : NarInfoDiskCache{settings}
     {
         auto state(_state.lock());
 
         createDirs(dirOf(dbPath));
 
-        state->db = SQLite(dbPath);
+        state->db = SQLite(dbPath, SQLite::Settings{sqliteSettings});
 
         state->db.isCache();
 
@@ -155,8 +154,8 @@ public:
                     .use()
                     // Use a minimum TTL to prevent --refresh from
                     // nuking the entire disk cache.
-                    (now - std::max(settings.ttlNegativeNarInfoCache.get(), 3600U))(
-                        now - std::max(settings.ttlPositiveNarInfoCache.get(), 30 * 24 * 3600U))
+                    (now - std::max(settings.ttlNegative.get(), 3600U))(
+                        now - std::max(settings.ttlPositive.get(), 30 * 24 * 3600U))
                     .exec();
 
                 debug("deleted %d entries from the NAR info disk cache", sqlite3_changes(state->db));
@@ -182,7 +181,7 @@ private:
     {
         auto i = state.caches.find(uri);
         if (i == state.caches.end()) {
-            auto queryCache(state.queryCache.use()(uri)(time(0) - cacheInfoTtl));
+            auto queryCache(state.queryCache.use()(uri)(time(0) - settings.ttlMeta));
             if (!queryCache.next())
                 return std::nullopt;
             auto cache = Cache{
@@ -254,8 +253,8 @@ public:
 
                 auto now = time(0);
 
-                auto queryNAR(state->queryNAR.use()(cache.id)(hashPart) (now - settings.ttlNegativeNarInfoCache)(
-                    now - settings.ttlPositiveNarInfoCache));
+                auto queryNAR(
+                    state->queryNAR.use()(cache.id)(hashPart) (now - settings.ttlNegative)(now - settings.ttlPositive));
 
                 if (!queryNAR.next())
                     return {oUnknown, 0};
@@ -264,8 +263,8 @@ public:
                     return {oInvalid, 0};
 
                 auto namePart = queryNAR.getStr(1);
-                auto narInfo =
-                    make_ref<NarInfo>(StorePath(hashPart + "-" + namePart), Hash::parseAnyPrefixed(queryNAR.getStr(6)));
+                auto narInfo = make_ref<NarInfo>(
+                    cache.storeDir, StorePath(hashPart + "-" + namePart), Hash::parseAnyPrefixed(queryNAR.getStr(6)));
                 narInfo->url = queryNAR.getStr(2);
                 narInfo->compression = queryNAR.getStr(3);
                 if (!queryNAR.isNull(4))
@@ -277,7 +276,7 @@ public:
                 if (!queryNAR.isNull(9))
                     narInfo->deriver = StorePath(queryNAR.getStr(9));
                 for (auto & sig : tokenizeString<Strings>(queryNAR.getStr(10), " "))
-                    narInfo->sigs.insert(sig);
+                    narInfo->sigs.insert(Signature::parse(sig));
                 narInfo->ca = ContentAddress::parseOpt(queryNAR.getStr(11));
 
                 return {oValid, narInfo};
@@ -296,7 +295,7 @@ public:
                 auto now = time(0);
 
                 auto queryRealisation(state->queryRealisation.use()(cache.id)(id.to_string())(
-                    now - settings.ttlNegativeNarInfoCache)(now - settings.ttlPositiveNarInfoCache));
+                    now - settings.ttlNegative)(now - settings.ttlPositive));
 
                 if (!queryRealisation.next())
                     return {oUnknown, 0};
@@ -337,8 +336,9 @@ public:
                         narInfo && narInfo->fileHash)(
                         narInfo ? narInfo->fileSize : 0, narInfo != 0 && narInfo->fileSize)(info->narHash.to_string(
                         HashFormat::Nix32, true))(info->narSize)(concatStringsSep(" ", info->shortRefs()))(
-                        info->deriver ? std::string(info->deriver->to_string()) : "", (bool) info->deriver)(
-                        concatStringsSep(" ", info->sigs))(renderContentAddress(info->ca))(time(0))
+                        info->deriver ? std::string(info->deriver->to_string()) : "",
+                        (bool) info->deriver)(concatStringsSep(" ", Signature::toStrings(info->sigs)))(
+                        renderContentAddress(info->ca))(time(0))
                     .exec();
 
             } else {
@@ -371,15 +371,15 @@ public:
     }
 };
 
-ref<NarInfoDiskCache> getNarInfoDiskCache()
+ref<NarInfoDiskCache> NarInfoDiskCache::get(const Settings & settings, SQLiteSettings sqliteSettings)
 {
-    static ref<NarInfoDiskCache> cache = make_ref<NarInfoDiskCacheImpl>();
+    static ref<NarInfoDiskCache> cache = make_ref<NarInfoDiskCacheImpl>(settings, sqliteSettings);
     return cache;
 }
 
-ref<NarInfoDiskCache> getTestNarInfoDiskCache(Path dbPath)
+ref<NarInfoDiskCache> NarInfoDiskCache::getTest(const Settings & settings, SQLiteSettings sqliteSettings, Path dbPath)
 {
-    return make_ref<NarInfoDiskCacheImpl>(dbPath);
+    return make_ref<NarInfoDiskCacheImpl>(settings, sqliteSettings, dbPath);
 }
 
 } // namespace nix

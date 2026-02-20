@@ -147,7 +147,7 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
        write the compressed NAR to disk), into a HashSink (to get the
        NAR hash), and into a NarAccessor (to get the NAR listing). */
     HashSink fileHashSink{HashAlgorithm::SHA256};
-    std::shared_ptr<SourceAccessor> narAccessor;
+    std::shared_ptr<NarAccessor> narAccessor;
     HashSink narHashSink{HashAlgorithm::SHA256};
     {
         FdSink fileSink(fdTemp.get());
@@ -156,7 +156,7 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
             config.compression, teeSinkCompressed, config.parallelCompression, config.compressionLevel);
         TeeSink teeSinkUncompressed{*compressionSink, narHashSink};
         TeeSource teeSource{narSource, teeSinkUncompressed};
-        narAccessor = makeNarAccessor(teeSource);
+        narAccessor = makeNarAccessor(parseNarListing(teeSource));
         compressionSink->finish();
         fileSink.flush();
     }
@@ -165,18 +165,18 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
 
     auto info = mkInfo(narHashSink.finish());
     auto narInfo = make_ref<NarInfo>(info);
-    narInfo->compression = config.compression;
+    narInfo->compression = config.compression.to_string(); // FIXME: Make NarInfo use CompressionAlgo
     auto [fileHash, fileSize] = fileHashSink.finish();
     narInfo->fileHash = fileHash;
     narInfo->fileSize = fileSize;
     narInfo->url = "nar/" + narInfo->fileHash->to_string(HashFormat::Nix32, false) + ".nar"
-                   + (config.compression == "xz"      ? ".xz"
-                      : config.compression == "bzip2" ? ".bz2"
-                      : config.compression == "zstd"  ? ".zst"
-                      : config.compression == "lzip"  ? ".lzip"
-                      : config.compression == "lz4"   ? ".lz4"
-                      : config.compression == "br"    ? ".br"
-                                                      : "");
+                   + (config.compression == CompressionAlgo::xz       ? ".xz"
+                      : config.compression == CompressionAlgo::bzip2  ? ".bz2"
+                      : config.compression == CompressionAlgo::zstd   ? ".zst"
+                      : config.compression == CompressionAlgo::lzip   ? ".lzip"
+                      : config.compression == CompressionAlgo::lz4    ? ".lz4"
+                      : config.compression == CompressionAlgo::brotli ? ".br"
+                                                                      : "");
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now1).count();
     printMsg(
@@ -205,7 +205,7 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
     if (config.writeNARListing) {
         nlohmann::json j = {
             {"version", 1},
-            {"root", listNarDeep(*narAccessor, CanonPath::root)},
+            {"root", narAccessor->getListing()},
         };
 
         upsertFile(std::string(info.path.hashPart()) + ".ls", j.dump(), "application/json");
@@ -435,37 +435,41 @@ void BinaryCacheStore::narFromPath(const StorePath & storePath, Sink & sink)
 void BinaryCacheStore::queryPathInfoUncached(
     const StorePath & storePath, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept
 {
-    auto uri = config.getReference().render(/*FIXME withParams=*/false);
-    auto storePathS = printStorePath(storePath);
-    auto act = std::make_shared<Activity>(
-        *logger,
-        lvlTalkative,
-        actQueryPathInfo,
-        fmt("querying info about '%s' on '%s'", storePathS, uri),
-        Logger::Fields{storePathS, uri});
-    PushActivity pact(act->id);
-
-    auto narInfoFile = narInfoFileFor(storePath);
-
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
-    getFile(narInfoFile, {[=, this](std::future<std::optional<std::string>> fut) {
-                try {
-                    auto data = fut.get();
+    try {
+        auto uri = config.getReference().render(/*FIXME withParams=*/false);
+        auto storePathS = printStorePath(storePath);
+        auto act = std::make_shared<Activity>(
+            *logger,
+            lvlTalkative,
+            actQueryPathInfo,
+            fmt("querying info about '%s' on '%s'", storePathS, uri),
+            Logger::Fields{storePathS, uri});
+        PushActivity pact(act->id);
 
-                    if (!data)
-                        return (*callbackPtr)({});
+        auto narInfoFile = narInfoFileFor(storePath);
 
-                    stats.narInfoRead++;
+        getFile(narInfoFile, {[=, this](std::future<std::optional<std::string>> fut) {
+                    try {
+                        auto data = fut.get();
 
-                    (*callbackPtr)(
-                        (std::shared_ptr<ValidPathInfo>) std::make_shared<NarInfo>(*this, *data, narInfoFile));
+                        if (!data)
+                            return (*callbackPtr)({});
 
-                    (void) act; // force Activity into this lambda to ensure it stays alive
-                } catch (...) {
-                    callbackPtr->rethrow();
-                }
-            }});
+                        stats.narInfoRead++;
+
+                        (*callbackPtr)(
+                            (std::shared_ptr<ValidPathInfo>) std::make_shared<NarInfo>(*this, *data, narInfoFile));
+
+                        (void) act; // force Activity into this lambda to ensure it stays alive
+                    } catch (...) {
+                        callbackPtr->rethrow();
+                    }
+                }});
+    } catch (...) {
+        callbackPtr->rethrow();
+    }
 }
 
 StorePath BinaryCacheStore::addToStore(
@@ -565,7 +569,7 @@ std::shared_ptr<SourceAccessor> BinaryCacheStore::getFSAccessor(const StorePath 
     return getRemoteFSAccessor(requireValidPath)->accessObject(storePath);
 }
 
-void BinaryCacheStore::addSignatures(const StorePath & storePath, const StringSet & sigs)
+void BinaryCacheStore::addSignatures(const StorePath & storePath, const std::set<Signature> & sigs)
 {
     /* Note: this is inherently racy since there is no locking on
        binary caches. In particular, with S3 this unreliable, even

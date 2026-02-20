@@ -341,6 +341,19 @@ struct Derivation : BasicDerivation
         DerivedPathMap<StringSet>::ChildNode::Map * actualInputs = nullptr) const;
 
     /**
+     * Determine whether this derivation should be resolved before building.
+     *
+     * Resolution is needed when:
+     * - Input-addressed derivations are deferred (depend on CA derivations)
+     * - Content-addressed derivations have input drvs and are either:
+     *   - Floating (non-fixed), which must always be resolved
+     *   - Fixed, which can optionally be resolved when ca-derivations is enabled
+     * - Impure derivations always need resolution
+     * - Any input derivations have outputs from dynamic derivations
+     */
+    bool shouldResolve() const;
+
+    /**
      * Return the underlying basic derivation but with these changes:
      *
      * 1. Input drvs are emptied, but the outputs of them that were used
@@ -453,9 +466,11 @@ struct Derivation : BasicDerivation
 class Store;
 
 /**
- * Write a derivation to the Nix store, and return its path.
+ * Compute the store path that would be used for a derivation without writing it.
+ *
+ * This is a pure computation based on the derivation content and store directory.
  */
-StorePath writeDerivation(Store & store, const Derivation & drv, RepairFlag repair = NoRepair, bool readOnly = false);
+StorePath computeStorePath(const StoreDirConfig & store, const Derivation & drv);
 
 /**
  * Read a derivation from a file.
@@ -585,6 +600,12 @@ void writeDerivation(Sink & out, const StoreDirConfig & store, const BasicDeriva
  * itself, making the hash near-impossible to calculate.
  */
 std::string hashPlaceholder(const OutputNameView outputName);
+
+/**
+ * The expected JSON version for derivation serialization.
+ * Used by `nix derivation show` and `nix derivation add`.
+ */
+constexpr unsigned expectedJsonVersionDerivation = 4;
 
 } // namespace nix
 

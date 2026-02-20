@@ -10,12 +10,6 @@ std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(co
     return next->getPhysicalPath(prefix / path);
 }
 
-std::string FilteringSourceAccessor::readFile(const CanonPath & path)
-{
-    checkAccess(path);
-    return next->readFile(prefix / path);
-}
-
 void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, std::function<void(uint64_t)> sizeCallback)
 {
     checkAccess(path);
@@ -65,6 +59,11 @@ std::pair<CanonPath, std::optional<std::string>> FilteringSourceAccessor::getFin
     if (fingerprint)
         return {path, fingerprint};
     return next->getFingerprint(prefix / path);
+}
+
+void FilteringSourceAccessor::invalidateCache(const CanonPath & path)
+{
+    next->invalidateCache(prefix / path);
 }
 
 void FilteringSourceAccessor::checkAccess(const CanonPath & path)

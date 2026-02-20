@@ -9,9 +9,32 @@
 #include "nix/store/names.hh"
 #include "nix/util/executable-path.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/config-global.hh"
 #include "self-exe.hh"
 
 using namespace nix;
+
+/**
+ * Settings related to upgrading Nix itself.
+ */
+struct UpgradeSettings : Config
+{
+    /**
+     * The URL of the file that contains the store paths of the latest Nix release.
+     */
+    Setting<std::string> storePathUrl{
+        this,
+        "https://github.com/NixOS/nixpkgs/raw/master/nixos/modules/installer/tools/nix-fallback-paths.nix",
+        "upgrade-nix-store-path-url",
+        R"(
+          Used by `nix upgrade-nix`, the URL of the file that contains the
+          store paths of the latest Nix release.
+        )"};
+};
+
+UpgradeSettings upgradeSettings;
+
+static GlobalConfig::Register rSettings(&upgradeSettings);
 
 struct CmdUpgradeNix : MixDryRun, StoreCommand
 {
@@ -31,7 +54,7 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
             .longName = "nix-store-paths-url",
             .description = "The URL of the file that contains the store paths of the latest Nix release.",
             .labels = {"url"},
-            .handler = {&(std::string &) settings.upgradeNixStorePathUrl},
+            .handler = {&(std::string &) upgradeSettings.storePathUrl},
         });
     }
 
@@ -67,7 +90,7 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
         if (profileDir == "")
             profileDir = getProfileDir(store);
 
-        printInfo("upgrading Nix in profile %s", profileDir);
+        printInfo("upgrading Nix in profile %s", PathFmt(profileDir));
 
         auto storePath = getLatestNix(store);
 
@@ -100,7 +123,7 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
                 *logger,
                 lvlInfo,
                 actUnknown,
-                fmt("installing '%s' into profile %s...", store->printStorePath(storePath), profileDir));
+                fmt("installing '%s' into profile %s...", store->printStorePath(storePath), PathFmt(profileDir)));
 
             // FIXME: don't call an external process.
             runProgram(
@@ -120,7 +143,7 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
             throw Error("couldn't figure out how Nix is installed, so I can't upgrade it");
         const auto & where = whereOpt->parent_path();
 
-        printInfo("found Nix in %s", where);
+        printInfo("found Nix in %s", PathFmt(where));
 
         if (hasPrefix(where.string(), "/run/current-system"))
             throw Error("Nix on NixOS must be upgraded via 'nixos-rebuild'");
@@ -132,17 +155,17 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
                && std::filesystem::is_symlink(profileDir))
             profileDir = readLink(profileDir.string());
 
-        printInfo("found profile %s", profileDir);
+        printInfo("found profile %s", PathFmt(profileDir));
 
         Path userEnv = canonPath(profileDir.string(), true);
 
         if (std::filesystem::exists(profileDir / "manifest.json"))
             throw Error(
                 "directory %s is managed by 'nix profile' and currently cannot be upgraded by 'nix upgrade-nix'",
-                profileDir);
+                PathFmt(profileDir));
 
         if (!std::filesystem::exists(profileDir / "manifest.nix"))
-            throw Error("directory %s does not appear to be part of a Nix profile", profileDir);
+            throw Error("directory %s does not appear to be part of a Nix profile", PathFmt(profileDir));
 
         if (!store->isValidPath(store->parseStorePath(userEnv)))
             throw Error("directory '%s' is not in the Nix store", userEnv);
@@ -156,10 +179,10 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
         Activity act(*logger, lvlInfo, actUnknown, "querying latest Nix version");
 
         // FIXME: use nixos.org?
-        auto req = FileTransferRequest(parseURL(settings.upgradeNixStorePathUrl.get()));
+        auto req = FileTransferRequest(parseURL(upgradeSettings.storePathUrl.get()));
         auto res = getFileTransfer()->download(req);
 
-        auto state = std::make_unique<EvalState>(LookupPath{}, store, fetchSettings, evalSettings);
+        auto state = std::make_shared<EvalState>(LookupPath{}, store, fetchSettings, evalSettings);
         auto v = state->allocValue();
         state->eval(state->parseExprFromString(res.data, state->rootPath(CanonPath("/no-such-path"))), *v);
         Bindings & bindings = Bindings::emptyBindings;

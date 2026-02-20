@@ -31,6 +31,8 @@ struct OptimiseStats
     uint64_t bytesFreed = 0;
 };
 
+struct LocalSettings;
+
 struct LocalBuildStoreConfig : virtual LocalFSStoreConfig
 {
 
@@ -38,7 +40,7 @@ private:
     /**
       Input for computing the build directory. See `getBuildDir()`.
      */
-    Setting<std::optional<Path>> buildDir{
+    Setting<std::optional<std::filesystem::path>> buildDir{
         this,
         std::nullopt,
         "build-dir",
@@ -61,9 +63,17 @@ private:
             > `build-dir` must not be set to a world-writable directory.
             > Placing temporary build directories in a world-writable place allows other users to access or modify build data that is currently in use.
             > This alone is merely an impurity, but combined with another factor this has allowed malicious derivations to escape the build sandbox.
+
+            See also the global [`build-dir`](@docroot@/command-ref/conf-file.md#conf-build-dir) setting.
         )"};
 public:
-    Path getBuildDir() const;
+    /**
+     * For now, this just grabs the global local settings, but by having this method we get ready for these being
+     * per-store settings instead.
+     */
+    const LocalSettings & getLocalSettings() const;
+
+    std::filesystem::path getBuildDir() const;
 };
 
 struct LocalStoreConfig : std::enable_shared_from_this<LocalStoreConfig>,
@@ -83,7 +93,6 @@ private:
     bool getDefaultRequireSigs();
 
 public:
-
     Setting<bool> requireSigs{
         this,
         getDefaultRequireSigs(),
@@ -107,6 +116,43 @@ public:
           > Using it when the filesystem is writable can cause incorrect query results or corruption errors if the database is changed by another process.
           > While the filesystem the database resides on might appear to be read-only, consider whether another user or system might have write access to it.
         )"};
+
+    bool getReadOnly() const override;
+
+    Setting<bool> ignoreGcDeleteFailure{
+        this,
+        false,
+        "ignore-gc-delete-failure",
+        R"(
+          Whether to ignore failures when deleting items with the garbage collector.
+
+          Normally the garbage collector will fail with an error if the nix daemon cannot delete a file, with this setting such errors will only be printed as warnings.
+        )",
+        {},
+        true,
+        Xp::LocalOverlayStore,
+    };
+
+    Setting<bool> useRootsDaemon{
+        this,
+        false,
+        "use-roots-daemon",
+        R"(
+          Whether to request garbage collector roots from an external daemon.
+
+          When enabled, the garbage collector connects to a Unix domain socket
+          at [`<state-dir>`](@docroot@/store/types/local-store.md#store-option-state)`/gc-roots-socket/socket` to discover additional roots
+          that should not be collected. This is useful when the Nix daemon runs
+          without root privileges and cannot scan `/proc` for runtime roots.
+
+          The daemon can be started with [`nix store roots-daemon`](@docroot@/command-ref/new-cli/nix3-store-roots-daemon.md).
+        )",
+        {},
+        true,
+        Xp::LocalOverlayStore,
+    };
+
+    std::filesystem::path getRootsSocketPath() const;
 
     static const std::string name()
     {
@@ -230,8 +276,6 @@ public:
 
     std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override;
 
-    StorePathSet querySubstitutablePaths(const StorePathSet & paths) override;
-
     bool pathInfoIsUntrusted(const ValidPathInfo &) override;
     bool realisationIsUntrusted(const Realisation &) override;
 
@@ -305,8 +349,11 @@ public:
      * Called by `collectGarbage` to recursively delete a path.
      * The default implementation simply calls `deletePath`, but it can be
      * overridden by stores that wish to provide their own deletion behaviour.
+     *
+     * @param isKnownPath true if this is a known store path, false if it's
+     *        garbage/unknown content found in the store directory
      */
-    virtual void deleteStorePath(const Path & path, uint64_t & bytesFreed);
+    virtual void deleteStorePath(const Path & path, uint64_t & bytesFreed, bool isKnownPath);
 
     /**
      * Optimise the disk space usage of the Nix store by hard-linking
@@ -368,7 +415,7 @@ public:
 
     void vacuumDB();
 
-    void addSignatures(const StorePath & storePath, const StringSet & sigs) override;
+    void addSignatures(const StorePath & storePath, const std::set<Signature> & sigs) override;
 
     /**
      * If free disk space in /nix/store if below minFree, delete
@@ -418,7 +465,7 @@ private:
 
     uint64_t queryValidPathId(State & state, const StorePath & path);
 
-    uint64_t addValidPath(State & state, const ValidPathInfo & info, bool checkOutputs = true);
+    uint64_t addValidPath(State & state, const ValidPathInfo & info);
 
     void invalidatePath(State & state, const StorePath & path);
 

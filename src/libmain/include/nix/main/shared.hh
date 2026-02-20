@@ -13,8 +13,6 @@
 
 namespace nix {
 
-int handleExceptions(const std::string & programName, std::function<void()> fun);
-
 /**
  * Don't forget to call initPlugins() after settings are initialized!
  * @param loadConfig Whether to load configuration from `nix.conf`, `NIX_CONFIG`, etc. May be disabled for unit tests.
@@ -91,19 +89,7 @@ extern volatile ::sig_atomic_t blockInt;
 
 struct GCResults;
 
-struct PrintFreed
-{
-    bool show;
-    const GCResults & results;
-
-    PrintFreed(bool show, const GCResults & results)
-        : show(show)
-        , results(results)
-    {
-    }
-
-    ~PrintFreed();
-};
+void printFreed(bool dryRun, const GCResults & results);
 
 #ifndef _WIN32
 /**

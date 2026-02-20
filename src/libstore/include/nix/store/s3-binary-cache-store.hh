@@ -3,6 +3,7 @@
 
 #include "nix/store/config.hh"
 #include "nix/store/http-binary-cache-store.hh"
+#include "nix/store/s3-url.hh"
 
 namespace nix {
 
@@ -12,7 +13,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
 
     S3BinaryCacheStoreConfig(std::string_view uriScheme, std::string_view bucketName, const Params & params);
 
-    const Setting<std::string> profile{
+    Setting<std::string> profile{
         this,
         "default",
         "profile",
@@ -21,7 +22,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
           Nix uses the `default` profile.
         )"};
 
-    const Setting<std::string> region{
+    Setting<std::string> region{
         this,
         "us-east-1",
         "region",
@@ -31,7 +32,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
           parameter.
         )"};
 
-    const Setting<std::string> scheme{
+    Setting<std::string> scheme{
         this,
         "https",
         "scheme",
@@ -46,22 +47,31 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
           > information.
         )"};
 
-    const Setting<std::string> endpoint{
+    Setting<std::string> endpoint{
         this,
         "",
         "endpoint",
         R"(
           The S3 endpoint to use. When empty (default), uses AWS S3 with
-          region-specific endpoints (e.g., s3.us-east-1.amazonaws.com).
-          For S3-compatible services such as MinIO, set this to your service's endpoint.
-
-          > **Note**
-          >
-          > Custom endpoints must support HTTPS and use path-based
-          > addressing instead of virtual host based addressing.
+          region-specific endpoints. For S3-compatible services such as
+          MinIO, set this to your service's endpoint.
         )"};
 
-    const Setting<bool> multipartUpload{
+    Setting<S3AddressingStyle> addressingStyle{
+        this,
+        S3AddressingStyle::Auto,
+        "addressing-style",
+        R"(
+          The S3 addressing style to use. `auto` (default) uses
+          virtual-hosted-style for standard AWS endpoints and path-style
+          for custom endpoints; bucket names containing dots automatically
+          fall back to path-style to avoid TLS certificate errors. `path`
+          forces path-style addressing (deprecated by AWS). `virtual`
+          forces virtual-hosted-style addressing (bucket names must not
+          contain dots).
+        )"};
+
+    Setting<bool> multipartUpload{
         this,
         false,
         "multipart-upload",
@@ -72,7 +82,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
           can improve performance and reliability for large uploads.
         )"};
 
-    const Setting<uint64_t> multipartChunkSize{
+    Setting<uint64_t> multipartChunkSize{
         this,
         5 * 1024 * 1024,
         "multipart-chunk-size",
@@ -83,7 +93,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
         )",
         {"buffer-size"}};
 
-    const Setting<uint64_t> multipartThreshold{
+    Setting<uint64_t> multipartThreshold{
         this,
         100 * 1024 * 1024,
         "multipart-threshold",
@@ -93,7 +103,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
           Default is 100 MiB. Only takes effect when multipart-upload is enabled.
         )"};
 
-    const Setting<std::optional<std::string>> storageClass{
+    Setting<std::optional<std::string>> storageClass{
         this,
         std::nullopt,
         "storage-class",
@@ -117,7 +127,7 @@ struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
      * Set of settings that are part of the S3 URI itself.
      * These are needed for region specification and other S3-specific settings.
      */
-    const std::set<const AbstractSetting *> s3UriSettings = {&profile, &region, &scheme, &endpoint};
+    const std::set<const AbstractSetting *> s3UriSettings = {&profile, &region, &scheme, &endpoint, &addressingStyle};
 
     static const std::string name()
     {

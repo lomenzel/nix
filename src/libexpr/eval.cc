@@ -318,7 +318,6 @@ EvalState::EvalState(
     countCalls = getEnv("NIX_COUNT_CALLS").value_or("0") != "0";
 
     static_assert(sizeof(Env) <= 16, "environment must be <= 16 bytes");
-    static_assert(sizeof(Counter) == 64, "counters must be 64 bytes");
 
     /* Construct the Nix expression search path. */
     assert(lookupPath.elements.empty());
@@ -467,7 +466,7 @@ void EvalState::addConstant(const std::string & name, Value * v, Constant info)
 
            We might know the type of a thunk in advance, so be allowed
            to just write it down in that case. */
-        if (auto gotType = v->type(true); gotType != nThunk)
+        if (auto gotType = v->type</*invalidIsThunk=*/true>(); gotType != nThunk)
             assert(info.type == gotType);
 
         /* Install value the base environment. */
@@ -741,6 +740,11 @@ public:
         inDebugger = true;
     }
 
+    DebuggerGuard(DebuggerGuard &&) = delete;
+    DebuggerGuard(const DebuggerGuard &) = delete;
+    DebuggerGuard & operator=(DebuggerGuard &&) = delete;
+    DebuggerGuard & operator=(const DebuggerGuard &) = delete;
+
     ~DebuggerGuard()
     {
         inDebugger = false;
@@ -881,7 +885,7 @@ void Value::mkPath(const SourcePath & path, EvalMemory & mem)
     mkPath(&*path.accessor, StringData::make(mem, path.path.abs()));
 }
 
-inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
+[[gnu::always_inline]] inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
 {
     for (auto l = var.level; l; --l, env = env->up)
         ;
@@ -899,11 +903,11 @@ inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
     while (1) {
         forceAttrs(*env->values[0], fromWith->pos, "while evaluating the first subexpression of a with expression");
         if (auto j = env->values[0]->attrs()->get(var.name)) {
-            if (countCalls)
+            if (countCalls) [[unlikely]]
                 attrSelects[j->pos]++;
             return j->value;
         }
-        if (!fromWith->parentWith)
+        if (!fromWith->parentWith) [[unlikely]]
             error<UndefinedVarError>("undefined variable '%1%'", symbols[var.name])
                 .atPos(var.pos)
                 .withFrame(*env, var)
@@ -1983,11 +1987,15 @@ void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
     UpdateQueue q;
     evalForUpdate(state, env, q);
 
-    v.mkAttrs(&Bindings::emptyBindings);
+    Value vTmp;
+    vTmp.mkAttrs(&Bindings::emptyBindings);
+
     for (auto & rhs : std::views::reverse(q)) {
         /* Remember that queue is sorted rightmost attrset first. */
-        eval(state, /*v=*/v, /*v1=*/v, /*v2=*/rhs);
+        eval(state, /*v=*/vTmp, /*v1=*/vTmp, /*v2=*/rhs);
     }
+
+    v = vTmp;
 }
 
 void Expr::evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx)
@@ -2403,6 +2411,8 @@ BackedStringView EvalState::coerceToString(
     bool copyToStore,
     bool canonicalizePath)
 {
+    auto _level = addCallDepth(pos);
+
     forceValue(v, pos);
 
     if (v.type() == nString) {
@@ -2622,6 +2632,8 @@ SingleDerivedPath EvalState::coerceToSingleDerivedPath(const PosIdx pos, Value &
 // `assert a == b; x` are critical for our users' testing UX.
 void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::string_view errorCtx)
 {
+    auto _level = addCallDepth(pos);
+
     // This implementation must match eqValues.
     forceValue(v1, pos);
     forceValue(v2, pos);
@@ -2828,6 +2840,8 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
 // This implementation must match assertEqValues
 bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_view errorCtx)
 {
+    auto _level = addCallDepth(pos);
+
     forceValue(v1, pos);
     forceValue(v2, pos);
 

@@ -57,19 +57,20 @@ let
         "nix-flake"
         "nix-flake-c"
         "nix-flake-tests"
+        "nix-nswrapper"
         "nix-main"
         "nix-main-c"
         "nix-cmd"
         "nix-cli"
         "nix-functional-tests"
         "nix-json-schema-checks"
-        "nix-kaitai-struct-checks"
       ]
       ++ lib.optionals enableBindings [
         "nix-perl-bindings"
       ]
       ++ lib.optionals enableDocs [
         "nix-manual"
+        "nix-manual-manpages-only"
         "nix-internal-api-docs"
         "nix-external-api-docs"
       ]

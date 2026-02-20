@@ -4,6 +4,7 @@
 #include "nix/util/types.hh"
 #include "nix/util/error.hh"
 #include "nix/util/file-descriptor.hh"
+#include "nix/util/file-path.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/ansicolor.hh"
 
@@ -35,6 +36,10 @@ class Pid
 #endif
 public:
     Pid();
+    Pid(const Pid &) = delete;
+    Pid(Pid && other) noexcept;
+    Pid & operator=(const Pid &) = delete;
+    Pid & operator=(Pid && other) noexcept;
 #ifndef _WIN32
     Pid(pid_t pid);
     void operator=(pid_t pid);
@@ -44,8 +49,8 @@ public:
     void operator=(AutoCloseFD pid);
 #endif
     ~Pid();
-    int kill();
-    int wait();
+    int kill(bool allowInterrupts = true);
+    int wait(bool allowInterrupts = true);
 
     // TODO: Implement for Windows
 #ifndef _WIN32
@@ -53,6 +58,18 @@ public:
     void setKillSignal(int signal);
     pid_t release();
 #endif
+
+    friend void swap(Pid & lhs, Pid & rhs) noexcept
+    {
+        using std::swap;
+#ifndef _WIN32
+        swap(lhs.pid, rhs.pid);
+        swap(lhs.separatePG, rhs.separatePG);
+        swap(lhs.killSignal, rhs.killSignal);
+#else
+        swap(lhs.pid, rhs.pid);
+#endif
+    }
 };
 
 #ifndef _WIN32
@@ -103,8 +120,8 @@ struct RunOptions
     std::optional<uid_t> uid;
     std::optional<uid_t> gid;
 #endif
-    std::optional<Path> chdir;
-    std::optional<StringMap> environment;
+    std::optional<std::filesystem::path> chdir;
+    std::optional<OsStringMap> environment;
     std::optional<std::string> input;
     Source * standardIn = nullptr;
     Sink * standardOut = nullptr;

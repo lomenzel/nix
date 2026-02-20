@@ -133,7 +133,7 @@ let
       +
         lib.optionalString
           (
-            !stdenv.hostPlatform.isWindows
+            !(stdenv.hostPlatform.isWindows || stdenv.hostPlatform.isCygwin)
             # build failure
             && !stdenv.hostPlatform.isStatic
             # LTO breaks exception handling on x86-64-darwin.
@@ -155,12 +155,14 @@ let
     ];
   };
 
-  mesonBuildLayer = finalAttrs: prevAttrs: {
+  mesonBuildLayer = finalAttrs: prevAttrs: rec {
     nativeBuildInputs = prevAttrs.nativeBuildInputs or [ ] ++ [
       pkg-config
     ];
     separateDebugInfo = !stdenv.hostPlatform.isStatic;
-    hardeningDisable = lib.optional stdenv.hostPlatform.isStatic "pie";
+    # needed by separateDebugInfo
+    # SEE: https://github.com/NixOS/nixpkgs/pull/394674/commits/a4d355342976e9e9823fb94f133bc43ebec9da5b
+    __structuredAttrs = separateDebugInfo;
   };
 
   mesonLibraryLayer = finalAttrs: prevAttrs: {
@@ -416,6 +418,8 @@ in
 
   nix-cmd = callPackage ../src/libcmd/package.nix { };
 
+  nix-nswrapper = callPackage ../src/nswrapper/package.nix { };
+
   /**
     The Nix command line interface. Note that this does not include its tests, whereas `nix-everything` does.
   */
@@ -429,6 +433,15 @@ in
     The manual as would be published on https://nix.dev/reference/nix-manual
   */
   nix-manual = callPackage ../doc/manual/package.nix { version = fineVersion; };
+
+  /**
+    Manpages only (no HTML manual, no mdbook dependency)
+  */
+  nix-manual-manpages-only = callPackage ../doc/manual/package.nix {
+    version = fineVersion;
+    buildHtmlManual = false;
+  };
+
   /**
     Doxygen pages for C++ code
   */
@@ -442,11 +455,6 @@ in
     JSON schema validation checks
   */
   nix-json-schema-checks = callPackage ../src/json-schema-checks/package.nix { };
-
-  /**
-    Kaitai struct schema validation checks
-  */
-  nix-kaitai-struct-checks = callPackage ../src/kaitai-struct-checks/package.nix { };
 
   nix-perl-bindings = callPackage ../src/perl/package.nix { };
 

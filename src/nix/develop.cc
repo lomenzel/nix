@@ -291,7 +291,7 @@ static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore
     }
     drv.fillInOutputPaths(*evalStore);
 
-    auto shellDrvPath = writeDerivation(*evalStore, drv);
+    auto shellDrvPath = evalStore->writeDerivation(drv);
 
     /* Build the derivation. */
     store->buildPaths(
@@ -501,7 +501,7 @@ struct Common : InstallableCommand, MixProfile
     {
         auto shellOutPath = getShellOutPath(store, installable);
 
-        updateProfile(shellOutPath);
+        updateProfile(*store, shellOutPath);
 
         debug("reading environment file '%s'", store->printStorePath(shellOutPath));
 
@@ -684,7 +684,7 @@ struct CmdDevelop : Common, MixEnvironment
         // https://github.com/NixOS/nix/issues/5873
         script += fmt("SHELL=\"%s\"\n", shell);
         if (foundInteractive)
-            script += fmt("PATH=\"%s${PATH:+:$PATH}\"\n", std::filesystem::path(shell).parent_path());
+            script += fmt("PATH=\"%s${PATH:+:$PATH}\"\n", std::filesystem::path(shell).parent_path().string());
         writeFull(rcFileFd.get(), script);
 
 #ifdef _WIN32 // TODO re-enable on Windows
@@ -703,7 +703,7 @@ struct CmdDevelop : Common, MixEnvironment
                 auto sourcePath = installableFlake->getLockedFlake()->flake.resolvedRef.input.getSourcePath();
                 if (sourcePath) {
                     if (chdir(sourcePath->c_str()) == -1) {
-                        throw SysError("chdir to %s failed", *sourcePath);
+                        throw SysError("chdir to %s failed", PathFmt(*sourcePath));
                     }
                 }
             }

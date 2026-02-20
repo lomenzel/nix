@@ -4,6 +4,7 @@
 #include <memory>
 #include <type_traits>
 
+#include "nix/util/compression-algo.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 #include "nix/util/file-descriptor.hh"
@@ -120,6 +121,8 @@ struct BufferedSource : virtual Source
 
     size_t read(char * data, size_t len) override;
 
+    std::string readLine(bool eofOk = false, char terminator = '\n');
+
     /**
      * Return true if the buffer is not empty.
      */
@@ -159,6 +162,8 @@ struct FdSink : BufferedSink
     }
 
     FdSink(FdSink &&) = default;
+    FdSink(const FdSink &) = delete;
+    FdSink & operator=(const FdSink &) = delete;
 
     FdSink & operator=(FdSink && s)
     {
@@ -200,8 +205,10 @@ struct FdSource : BufferedSource, RestartableSource
     }
 
     FdSource(FdSource &&) = default;
-
     FdSource & operator=(FdSource && s) = default;
+    FdSource(const FdSource &) = delete;
+    FdSource & operator=(const FdSource & s) = delete;
+    ~FdSource() = default;
 
     bool good() override;
     void restart() override;
@@ -284,7 +291,7 @@ struct CompressedSource : RestartableSource
 {
 private:
     std::string compressedData;
-    std::string compressionMethod;
+    CompressionAlgo compressionMethod;
     StringSource stringSource;
 
 public:
@@ -292,9 +299,9 @@ public:
      * Compress a RestartableSource using the specified compression method.
      *
      * @param source The source data to compress
-     * @param compressionMethod The compression method to use (e.g., "xz", "br")
+     * @param compressionMethod The compression method to use
      */
-    CompressedSource(RestartableSource & source, const std::string & compressionMethod);
+    CompressedSource(RestartableSource & source, CompressionAlgo compressionMethod);
 
     size_t read(char * data, size_t len) override
     {
@@ -309,11 +316,6 @@ public:
     uint64_t size() const
     {
         return compressedData.size();
-    }
-
-    std::string_view getCompressionMethod() const
-    {
-        return compressionMethod;
     }
 };
 
@@ -451,6 +453,11 @@ struct LambdaSink : Sink
         , cleanupFun(cleanupFun)
     {
     }
+
+    LambdaSink(LambdaSink &&) = delete;
+    LambdaSink(const LambdaSink &) = delete;
+    LambdaSink & operator=(LambdaSink &&) = delete;
+    LambdaSink & operator=(const LambdaSink &) = delete;
 
     ~LambdaSink()
     {
@@ -628,6 +635,11 @@ struct FramedSource : Source
     {
     }
 
+    FramedSource(FramedSource &&) = delete;
+    FramedSource(const FramedSource &) = delete;
+    FramedSource & operator=(FramedSource &&) = delete;
+    FramedSource & operator=(const FramedSource &) = delete;
+
     ~FramedSource()
     {
         try {
@@ -684,6 +696,11 @@ struct FramedSink : nix::BufferedSink
         , checkError(checkError)
     {
     }
+
+    FramedSink(FramedSink &&) = delete;
+    FramedSink(const FramedSink &) = delete;
+    FramedSink & operator=(FramedSink &&) = delete;
+    FramedSink & operator=(const FramedSink &) = delete;
 
     ~FramedSink()
     {

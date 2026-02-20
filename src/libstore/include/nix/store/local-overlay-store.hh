@@ -19,7 +19,7 @@ struct LocalOverlayStoreConfig : virtual LocalStoreConfig
     {
     }
 
-    const Setting<std::string> lowerStoreUri{
+    Setting<std::string> lowerStoreUri{
         (StoreConfig *) this,
         "",
         "lower-store",
@@ -31,7 +31,7 @@ struct LocalOverlayStoreConfig : virtual LocalStoreConfig
           Must be used as OverlayFS lower layer for this store's store dir.
         )"};
 
-    const PathSetting upperLayer{
+    PathSetting upperLayer{
         (StoreConfig *) this,
         "",
         "upper-layer",
@@ -53,7 +53,7 @@ struct LocalOverlayStoreConfig : virtual LocalStoreConfig
           default, but can be disabled if needed.
         )"};
 
-    const PathSetting remountHook{
+    PathSetting remountHook{
         (StoreConfig *) this,
         "",
         "remount-hook",
@@ -184,7 +184,7 @@ private:
      * Check which layers the store object exists in to try to avoid
      * needing to remount.
      */
-    void deleteStorePath(const Path & path, uint64_t & bytesFreed) override;
+    void deleteStorePath(const Path & path, uint64_t & bytesFreed, bool isKnownPath) override;
 
     /**
      * Deduplicate by removing store objects from the upper layer that

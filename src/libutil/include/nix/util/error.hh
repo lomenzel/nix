@@ -17,6 +17,7 @@
 
 #include "nix/util/suggestions.hh"
 #include "nix/util/fmt.hh"
+#include "nix/util/config.hh"
 
 #include <cstring>
 #include <list>
@@ -27,6 +28,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#  include <errhandlingapi.h>
+#endif
 
 namespace nix {
 
@@ -123,25 +127,25 @@ public:
     BaseError & operator=(BaseError &&) = default;
 
     template<typename... Args>
-    BaseError(unsigned int status, const Args &... args)
-        : err{.level = lvlError, .msg = HintFmt(args...), .status = status}
+    BaseError(unsigned int status, Args &&... args)
+        : err{.level = lvlError, .msg = HintFmt(std::forward<Args>(args)...), .pos = {}, .status = status}
     {
     }
 
     template<typename... Args>
-    explicit BaseError(const std::string & fs, const Args &... args)
-        : err{.level = lvlError, .msg = HintFmt(fs, args...)}
+    explicit BaseError(const std::string & fs, Args &&... args)
+        : err{.level = lvlError, .msg = HintFmt(fs, std::forward<Args>(args)...), .pos = {}}
     {
     }
 
     template<typename... Args>
-    BaseError(const Suggestions & sug, const Args &... args)
-        : err{.level = lvlError, .msg = HintFmt(args...), .suggestions = sug}
+    BaseError(const Suggestions & sug, Args &&... args)
+        : err{.level = lvlError, .msg = HintFmt(std::forward<Args>(args)...), .pos = {}, .suggestions = sug}
     {
     }
 
     BaseError(HintFmt hint)
-        : err{.level = lvlError, .msg = hint}
+        : err{.level = lvlError, .msg = hint, .pos = {}}
     {
     }
 
@@ -156,7 +160,7 @@ public:
     }
 
     /** The error message without "error: " prefixed to it. */
-    std::string message()
+    std::string message() const
     {
         return err.msg.str();
     }
@@ -200,9 +204,9 @@ public:
      * @param args... Format string arguments.
      */
     template<typename... Args>
-    void addTrace(std::shared_ptr<const Pos> && pos, std::string_view fs, const Args &... args)
+    void addTrace(std::shared_ptr<const Pos> && pos, std::string_view fs, Args &&... args)
     {
-        addTrace(std::move(pos), HintFmt(std::string(fs), args...));
+        addTrace(std::move(pos), HintFmt(std::string(fs), std::forward<Args>(args)...));
     }
 
     /**
@@ -237,9 +241,59 @@ MakeError(UsageError, Error);
 MakeError(UnimplementedError, Error);
 
 /**
- * To use in catch-blocks.
+ * To use in catch-blocks. Provides a convenience method to get the portable
+ * std::error_code. Use when you want to catch and check an error condition like
+ * no_such_file_or_directory (ENOENT) without ifdefs.
  */
-MakeError(SystemError, Error);
+class SystemError : public Error
+{
+    std::error_code errorCode;
+    std::string errorDetails;
+
+protected:
+
+    /**
+     * Just here to allow derived classes to use the right constructor
+     * (the protected one).
+     */
+    struct Disambig
+    {};
+
+    /**
+     * Protected constructor for subclasses that provide their own error message.
+     * The error message is appended to the formatted hint.
+     */
+    template<typename... Args>
+    SystemError(Disambig, std::error_code errorCode, std::string_view errorDetails, Args &&... args)
+        : Error("")
+        , errorCode(errorCode)
+        , errorDetails(errorDetails)
+    {
+        auto hf = HintFmt(std::forward<Args>(args)...);
+        err.msg = HintFmt("%s: %s", Uncolored(hf.str()), errorDetails);
+    }
+
+public:
+    /**
+     * Construct with an error code. The error code's message is automatically
+     * appended to the error message.
+     */
+    template<typename... Args>
+    SystemError(std::error_code errorCode, Args &&... args)
+        : SystemError(Disambig{}, errorCode, errorCode.message(), std::forward<Args>(args)...)
+    {
+    }
+
+    const std::error_code ec() const &
+    {
+        return errorCode;
+    }
+
+    bool is(std::errc e) const
+    {
+        return errorCode == e;
+    }
+};
 
 /**
  * POSIX system error, created using `errno`, `strerror` friends.
@@ -267,12 +321,14 @@ public:
      * will be used to try to add additional information to the message.
      */
     template<typename... Args>
-    SysError(int errNo, const Args &... args)
-        : SystemError("")
+    SysError(int errNo, Args &&... args)
+        : SystemError(
+              Disambig{},
+              std::make_error_code(static_cast<std::errc>(errNo)),
+              strerror(errNo),
+              std::forward<Args>(args)...)
         , errNo(errNo)
     {
-        auto hf = HintFmt(args...);
-        err.msg = HintFmt("%1%: %2%", Uncolored(hf.str()), strerror(errNo));
     }
 
     /**
@@ -282,30 +338,11 @@ public:
      * calling this constructor!
      */
     template<typename... Args>
-    SysError(const Args &... args)
-        : SysError(errno, args...)
+    SysError(Args &&... args)
+        : SysError(errno, std::forward<Args>(args)...)
     {
     }
 };
-
-#ifdef _WIN32
-namespace windows {
-class WinError;
-}
-#endif
-
-/**
- * Convenience alias for when we use a `errno`-based error handling
- * function on Unix, and `GetLastError()`-based error handling on on
- * Windows.
- */
-using NativeSysError =
-#ifdef _WIN32
-    windows::WinError
-#else
-    SysError
-#endif
-    ;
 
 /**
  * Throw an exception for the purpose of checking that exception
@@ -320,10 +357,94 @@ void throwExceptionSelfCheck();
 void panic(std::string_view msg);
 
 /**
+ * Run a function, printing an error and returning on exception.
+ * Useful for wrapping a `main` function that may throw
+ *
+ * @param programName Name of program, usually argv[0]
+ * @param fun Function to run inside the try block
+ * @return exit code: 0 if success, 1 if exception does not specify.
+ */
+int handleExceptions(const std::string & programName, std::function<void()> fun);
+
+/**
  * Print a basic error message with source position and std::terminate().
  *
  * @note: This assumes that the logger is operational
  */
 [[gnu::noinline, gnu::cold, noreturn]] void unreachable(std::source_location loc = std::source_location::current());
+
+#if NIX_UBSAN_ENABLED
+/* When building with sanitizers, also enable expensive unreachable checks. In
+   optimised builds this explicitly invokes UB with std::unreachable for better
+   optimisations. */
+#  define nixUnreachableWhenHardened ::nix::unreachable
+#else
+#  define nixUnreachableWhenHardened std::unreachable
+#endif
+
+#ifdef _WIN32
+
+namespace windows {
+
+/**
+ * Windows Error type.
+ *
+ * Unless you need to catch a specific error number, don't catch this in
+ * portable code. Catch `SystemError` instead.
+ */
+class WinError : public SystemError
+{
+public:
+    DWORD lastError;
+
+    /**
+     * Construct using the explicitly-provided error number.
+     * `FormatMessageA` will be used to try to add additional
+     * information to the message.
+     */
+    template<typename... Args>
+    WinError(DWORD lastError, Args &&... args)
+        : SystemError(
+              Disambig{},
+              std::error_code(lastError, std::system_category()),
+              renderError(lastError),
+              std::forward<Args>(args)...)
+        , lastError(lastError)
+    {
+    }
+
+    /**
+     * Construct using `GetLastError()` and the ambient "last error".
+     *
+     * Be sure to not perform another last-error-modifying operation
+     * before calling this constructor!
+     */
+    template<typename... Args>
+    WinError(Args &&... args)
+        : WinError(GetLastError(), std::forward<Args>(args)...)
+    {
+    }
+
+private:
+
+    static std::string renderError(DWORD lastError);
+};
+
+} // namespace windows
+
+#endif
+
+/**
+ * Convenience alias for when we use a `errno`-based error handling
+ * function on Unix, and `GetLastError()`-based error handling on on
+ * Windows.
+ */
+using NativeSysError =
+#ifdef _WIN32
+    windows::WinError
+#else
+    SysError
+#endif
+    ;
 
 } // namespace nix

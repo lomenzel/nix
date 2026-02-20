@@ -154,7 +154,7 @@ struct PathInputScheme : InputScheme
 
         time_t mtime = 0;
         if (!storePath || storePath->name() != "source" || !store.isValidPath(*storePath)) {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", absPath));
+            Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", PathFmt(absPath)));
             // FIXME: try to substitute storePath.
             auto src = sinkToSource(
                 [&](Sink & sink) { mtime = dumpPathAndGetMtime(absPath.string(), sink, defaultPathFilter); });
@@ -165,15 +165,12 @@ struct PathInputScheme : InputScheme
 
         // To prevent `fetchToStore()` copying the path again to Nix
         // store, pre-create an entry in the fetcher cache.
-        auto info = store.queryPathInfo(*storePath);
-        accessor->fingerprint =
-            fmt("path:%s", store.queryPathInfo(*storePath)->narHash.to_string(HashFormat::SRI, true));
+        auto narHash = store.queryPathInfo(*storePath)->narHash.to_string(HashFormat::SRI, true);
+        accessor->fingerprint = fmt("path:%s", narHash);
         settings.getCache()->upsert(
-            makeFetchToStoreCacheKey(
-                input.getName(), *accessor->fingerprint, ContentAddressMethod::Raw::NixArchive, "/"),
-            store,
-            {},
-            *storePath);
+            makeSourcePathToHashCacheKey(
+                *accessor->fingerprint, ContentAddressMethod::Raw::NixArchive, CanonPath::root),
+            {{"hash", narHash}});
 
         /* Trust the lastModified value supplied by the user, if
            any. It's not a "secure" attribute so we don't care. */

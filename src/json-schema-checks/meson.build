@@ -32,8 +32,8 @@ schemas = [
     'stem' : 'hash',
     'schema' : schema_dir / 'hash-v1.yaml',
     'files' : [
-      'sha256-base16.json',
-      'blake3-base16.json',
+      'sha256.json',
+      'blake3.json',
     ],
   },
   {
@@ -62,9 +62,11 @@ schemas = [
   },
   {
     'stem' : 'build-trace-entry',
-    'schema' : schema_dir / 'build-trace-entry-v1.yaml',
+    'schema' : schema_dir / 'build-trace-entry-v2.yaml',
     'files' : [
       'simple.json',
+      # The field is no longer supported, but we want to show that we
+      # ignore it during parsing.
       'with-dependent-realisations.json',
       'with-signature.json',
     ],
@@ -73,12 +75,12 @@ schemas = [
     'stem' : 'derivation-options',
     'schema' : schema_dir / 'derivation-options-v1.yaml',
     'files' : [
-      'ia' / 'defaults.json',
-      'ia' / 'all_set.json',
-      'ia' / 'structuredAttrs_defaults.json',
-      'ia' / 'structuredAttrs_all_set.json',
-      'ca' / 'all_set.json',
-      'ca' / 'structuredAttrs_all_set.json',
+      'ia' / 'derivation-options' / 'defaults.json',
+      'ia' / 'derivation-options' / 'all_set.json',
+      'ia' / 'derivation-options' / 'structuredAttrs_defaults.json',
+      'ia' / 'derivation-options' / 'structuredAttrs_all_set.json',
+      'ca' / 'derivation-options' / 'all_set.json',
+      'ca' / 'derivation-options' / 'structuredAttrs_all_set.json',
     ],
   },
 ]

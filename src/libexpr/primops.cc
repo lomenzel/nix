@@ -163,24 +163,20 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
     return res;
 }
 
-static SourcePath realisePath(
-    EvalState & state,
-    const PosIdx pos,
-    Value & v,
-    std::optional<SymlinkResolution> resolveSymlinks = SymlinkResolution::Full)
+SourcePath EvalState::realisePath(const PosIdx pos, Value & v, std::optional<SymlinkResolution> resolveSymlinks)
 {
     NixStringContext context;
 
-    auto path = state.coerceToPath(noPos, v, context, "while realising the context of a path");
+    auto path = coerceToPath(noPos, v, context, "while realising the context of a path");
 
     try {
-        if (!context.empty() && path.accessor == state.rootFS) {
-            auto rewrites = state.realiseContext(context);
+        if (!context.empty() && path.accessor == rootFS) {
+            auto rewrites = realiseContext(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
         return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
     } catch (Error & e) {
-        e.addTrace(state.positions[pos], "while realising the context of path '%s'", path);
+        e.addTrace(positions[pos], "while realising the context of path '%s'", path);
         throw;
     }
 }
@@ -300,7 +296,7 @@ static void scopedImport(EvalState & state, const PosIdx pos, SourcePath & path,
    argument. */
 static void import(EvalState & state, const PosIdx pos, Value & vPath, Value * vScope, Value & v)
 {
-    auto path = realisePath(state, pos, vPath, std::nullopt);
+    auto path = state.realisePath(pos, vPath, std::nullopt);
     auto path2 = path.path.abs();
 
     // FIXME
@@ -453,7 +449,7 @@ extern "C" typedef void (*ValueInitializer)(EvalState & state, Value & v);
 /* Load a ValueInitializer from a DSO and return whatever it initializes */
 void prim_importNative(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    auto path = realisePath(state, pos, *args[0]);
+    auto path = state.realisePath(pos, *args[0]);
 
     std::string sym(
         state.forceStringNoCtx(*args[1], pos, "while evaluating the second argument passed to builtins.importNative"));
@@ -1824,8 +1820,13 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         drv.fillInOutputPaths(*state.store);
     }
 
-    /* Write the resulting term into the Nix store directory. */
-    auto drvPath = writeDerivation(*state.store, drv, state.repair);
+    /* Write the resulting term into the Nix store directory.
+
+       Unless we are in read-only mode, that is, in which case we do not
+       write anything. Users commonly do this to speed up evaluation in
+       contexts where they don't actually want to build anything. */
+    auto drvPath =
+        settings.readOnlyMode ? computeStorePath(*state.store, drv) : state.store->writeDerivation(drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
@@ -1977,7 +1978,7 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
             arg.type() == nString && (arg.string_view().ends_with("/") || arg.string_view().ends_with("/."));
 
         auto symlinkResolution = mustBeDir ? SymlinkResolution::Full : SymlinkResolution::Ancestors;
-        auto path = realisePath(state, pos, arg, symlinkResolution);
+        auto path = state.realisePath(pos, arg, symlinkResolution);
 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
@@ -2084,7 +2085,7 @@ static RegisterPrimOp primop_dirOf({
 /* Return the contents of a file as a string. */
 static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    auto path = realisePath(state, pos, *args[0]);
+    auto path = state.realisePath(pos, *args[0]);
     auto s = path.readFile();
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
@@ -2319,7 +2320,7 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
     if (!ha)
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(pos).debugThrow();
 
-    auto path = realisePath(state, pos, *args[1]);
+    auto path = state.realisePath(pos, *args[1]);
 
     v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
 }
@@ -2371,7 +2372,7 @@ static const Value & fileTypeToString(EvalState & state, SourceAccessor::Type ty
 
 static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    auto path = realisePath(state, pos, *args[0], std::nullopt);
+    auto path = state.realisePath(pos, *args[0], std::nullopt);
     /* Retrieve the directory entry type and stringize it. */
     v = fileTypeToString(state, path.lstat().type);
 }
@@ -2389,7 +2390,7 @@ static RegisterPrimOp primop_readFileType({
 /* Read a directory (without . or ..) */
 static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    auto path = realisePath(state, pos, *args[0]);
+    auto path = state.realisePath(pos, *args[0]);
 
     // Retrieve directory entries for all nodes in a directory.
     // This is similar to `getFileType` but is optimized to reduce system calls
@@ -2813,11 +2814,18 @@ static void addPath(
     const NixStringContext & context)
 {
     try {
-        if (path.accessor == state.rootFS && state.store->isInStore(path.path.abs())) {
+        StorePathSet refs;
+
+        if (path.accessor == state.rootFS && state.store->isInStore(path.path.abs()) && !context.empty()) {
             // FIXME: handle CA derivation outputs (where path needs to
             // be rewritten to the actual output).
             auto rewrites = state.realiseContext(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
+            auto [storePath, subPath] = state.store->toStorePath(path.path.abs());
+            try {
+                refs = state.store->queryPathInfo(storePath)->references;
+            } catch (Error &) { // FIXME: should be InvalidPathError
+            }
         }
 
         std::unique_ptr<PathFilter> filter;
@@ -2830,18 +2838,27 @@ static void addPath(
         std::optional<StorePath> expectedStorePath;
         if (expectedHash)
             expectedStorePath = state.store->makeFixedOutputPathFromCA(
-                name, ContentAddressWithReferences::fromParts(method, *expectedHash, {}));
+                name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
 
         if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
-            auto dstPath = fetchToStore(
-                state.fetchSettings,
-                *state.store,
-                path.resolveSymlinks(),
-                settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
-                name,
-                method,
-                filter.get(),
-                state.repair);
+            // FIXME: support refs in fetchToStore()?
+            auto dstPath = refs.empty() ? fetchToStore(
+                                              state.fetchSettings,
+                                              *state.store,
+                                              path.resolveSymlinks(),
+                                              settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
+                                              name,
+                                              method,
+                                              filter.get(),
+                                              state.repair)
+                                        : state.store->addToStore(
+                                              name,
+                                              path.resolveSymlinks(),
+                                              method,
+                                              HashAlgorithm::SHA256,
+                                              refs,
+                                              filter ? *filter.get() : defaultPathFilter,
+                                              state.repair);
             if (expectedHash && expectedStorePath != dstPath)
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(pos)
@@ -2992,16 +3009,19 @@ static RegisterPrimOp primop_path({
 
         - recursive\
           When `false`, when `path` is added to the store it is with a
-          flat hash, rather than a hash of the NAR serialization of the
-          file. Thus, `path` must refer to a regular file, not a
+          [flat hash](@docroot@/store/file-system-object/content-address.md#serial-flat),
+          rather than a hash of the
+          [NAR serialization](@docroot@/store/file-system-object/content-address.md#serial-nix-archive)
+          of the file. Thus, `path` must refer to a regular file, not a
           directory. This allows similar behavior to `fetchurl`. Defaults
           to `true`.
 
         - sha256\
-          When provided, this is the expected hash of the file at the
-          path. Evaluation fails if the hash is incorrect, and
-          providing a hash allows `builtins.path` to be used even when the
-          `pure-eval` nix config option is on.
+          When provided, this is the expected
+          [content hash](@docroot@/store/file-system-object/content-address.md)
+          of the path. Evaluation fails if the hash is incorrect,
+          and providing a hash allows `builtins.path` to be used even
+          when the `pure-eval` nix config option is on.
     )",
     .fun = prim_path,
 });
@@ -4483,6 +4503,8 @@ static RegisterPrimOp primop_sort({
 
         1. Transitivity
 
+        If a is less than b and b is less than c, then it follows that a is less than c.
+
         ```nix
         comparator a b && comparator b c -> comparator a c
         ```
@@ -4495,9 +4517,23 @@ static RegisterPrimOp primop_sort({
 
         1. Transitivity of equivalence
 
+        First, two values a and b are considered equivalent with respect to the comparator if:
+
+        ```
+        !comparator a b && !comparator b a
+        ```
+
+        In other words, neither is considered "less than" the other.
+
+        Transitivity of equivalence means:
+
+        If a is equivalent to b, and b is equivalent to c, then a must also be equivalent to c.
+
         ```nix
-        let equiv = a: b: (!comparator a b && !comparator b a); in
-        equiv a b && equiv b c -> equiv a c
+        let
+          equiv = x: y: (!comparator x y && !comparator y x);
+        in
+          equiv a b && equiv b c -> equiv a c
         ```
 
       If the *comparator* violates any of these properties, then `builtins.sort`
@@ -5115,21 +5151,28 @@ static RegisterPrimOp primop_convertHash({
 
 struct RegexCache
 {
-    boost::concurrent_flat_map<std::string, std::regex, StringViewHash, std::equal_to<>> cache;
-
-    std::regex get(std::string_view re)
+    struct Entry
     {
-        std::regex regex;
-        /* No std::regex constructor overload from std::string_view, but can be constructed
-           from a pointer + size or an iterator range. */
+        ref<const std::regex> regex;
+
+        Entry(const char * s, size_t count)
+            : regex(make_ref<const std::regex>(s, count, std::regex::extended))
+        {
+        }
+    };
+
+    boost::concurrent_flat_map<std::string, Entry, StringViewHash, std::equal_to<>> cache;
+
+    ref<const std::regex> get(std::string_view re)
+    {
+        std::optional<ref<const std::regex>> regex;
         cache.try_emplace_and_cvisit(
             re,
             /*s=*/re.data(),
             /*count=*/re.size(),
-            std::regex::extended,
-            [&regex](const auto & kv) { regex = kv.second; },
-            [&regex](const auto & kv) { regex = kv.second; });
-        return regex;
+            [&regex](const auto & kv) { regex = kv.second.regex; },
+            [&regex](const auto & kv) { regex = kv.second.regex; });
+        return *regex;
     }
 };
 
@@ -5151,7 +5194,7 @@ void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.match");
 
         std::cmatch match;
-        if (!std::regex_match(str.begin(), str.end(), match, regex)) {
+        if (!std::regex_match(str.begin(), str.end(), match, *regex)) {
             v.mkNull();
             return;
         }
@@ -5224,7 +5267,7 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.split");
 
-        auto begin = std::cregex_iterator(str.begin(), str.end(), regex);
+        auto begin = std::cregex_iterator(str.begin(), str.end(), *regex);
         auto end = std::cregex_iterator();
 
         // Any matches results are surrounded by non-matching results.

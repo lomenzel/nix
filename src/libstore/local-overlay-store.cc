@@ -43,7 +43,7 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
     , LocalFSStore{*config}
     , LocalStore{static_cast<ref<const LocalStore::Config>>(config)}
     , config{config}
-    , lowerStore(openStore(percentDecode(config->lowerStoreUri.get())).dynamic_pointer_cast<LocalFSStore>())
+    , lowerStore(openStore(config->lowerStoreUri.get()).dynamic_pointer_cast<LocalFSStore>())
 {
     if (config->checkMount.get()) {
         std::smatch match;
@@ -204,7 +204,7 @@ void LocalOverlayStore::collectGarbage(const GCOptions & options, GCResults & re
     remountIfNecessary();
 }
 
-void LocalOverlayStore::deleteStorePath(const Path & path, uint64_t & bytesFreed)
+void LocalOverlayStore::deleteStorePath(const Path & path, uint64_t & bytesFreed, bool isKnownPath)
 {
     auto mergedDir = config->realStoreDir.get() + "/";
     if (path.substr(0, mergedDir.length()) != mergedDir) {
@@ -226,7 +226,7 @@ void LocalOverlayStore::deleteStorePath(const Path & path, uint64_t & bytesFreed
         } else {
             // Path does not exist in lower store.
             // So we can delete via overlayfs and not need to remount.
-            LocalStore::deleteStorePath(path, bytesFreed);
+            LocalStore::deleteStorePath(path, bytesFreed, isKnownPath);
         }
     }
 }
@@ -246,7 +246,7 @@ void LocalOverlayStore::optimiseStore()
         if (lowerStore->isValidPath(path)) {
             uint64_t bytesFreed = 0;
             // Deduplicate store path
-            deleteStorePath(toRealPath(path), bytesFreed);
+            deleteStorePath(toRealPath(path), bytesFreed, true);
         }
         done++;
         act.progress(done, paths.size());

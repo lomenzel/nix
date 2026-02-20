@@ -313,9 +313,9 @@ static void main_nix_build(int argc, char ** argv)
         throw UsageError("'-p' and '-E' are mutually exclusive");
 
     auto store = openStore();
-    auto evalStore = myArgs.evalStoreUrl ? openStore(*myArgs.evalStoreUrl) : store;
+    auto evalStore = myArgs.evalStoreUrl ? openStore(StoreReference{*myArgs.evalStoreUrl}) : store;
 
-    auto state = std::make_unique<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);
+    auto state = std::make_shared<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);
     state->repair = myArgs.repair;
     if (myArgs.repair)
         buildMode = bmRepair;
@@ -531,7 +531,7 @@ static void main_nix_build(int argc, char ** argv)
             shell = store->printStorePath(shellDrvOutputs.at("out").value()) + "/bin/bash";
         }
 
-        if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
+        if (drv.shouldResolve()) {
             auto resolvedDrv = drv.tryResolve(*store);
             assert(resolvedDrv && "Successfully resolved the derivation");
             drv = *resolvedDrv;
@@ -552,7 +552,10 @@ static void main_nix_build(int argc, char ** argv)
 
         env["NIX_BUILD_TOP"] = env["TMPDIR"] = env["TEMPDIR"] = env["TMP"] = env["TEMP"] = tmpDir.path().string();
         env["NIX_STORE"] = store->storeDir;
-        env["NIX_BUILD_CORES"] = fmt("%d", settings.buildCores ? settings.buildCores : settings.getDefaultCores());
+        env["NIX_BUILD_CORES"] =
+            fmt("%d",
+                settings.getLocalSettings().buildCores ? settings.getLocalSettings().buildCores
+                                                       : settings.getDefaultCores());
 
         DerivationOptions<StorePath> drvOptions;
         try {
@@ -613,6 +616,8 @@ static void main_nix_build(int argc, char ** argv)
            environment variables and shell functions.  Also don't
            lose the current $PATH directories. */
         auto rcfile = (tmpDir.path() / "rc").string();
+        auto tz = getEnv("TZ");
+        auto tzExport = tz ? "export TZ=" + escapeShellArgAlways(*tz) + "; " : "";
         std::string rc = fmt(
                 (R"(_nix_shell_clean_tmpdir() { command rm -rf %1%; };)"s
                   "trap _nix_shell_clean_tmpdir EXIT; "
@@ -646,7 +651,7 @@ static void main_nix_build(int argc, char ** argv)
                 (pure ? "" : "PATH=$PATH:$p; unset p; "),
                 escapeShellArgAlways(dirOf(*shell)),
                 escapeShellArgAlways(*shell),
-                (getenv("TZ") ? (std::string("export TZ=") + escapeShellArgAlways(getenv("TZ")) + "; ") : ""),
+                tzExport,
                 envCommand);
         vomit("Sourcing nix-shell with file %s and contents:\n%s", rcfile, rc);
         writeFile(rcfile, rc);

@@ -1,5 +1,6 @@
 #include "nix/main/shared.hh"
 #include "nix/store/realisation.hh"
+#include "nix/store/legacy-ssh-store.hh"
 #include "nix/store/store-open.hh"
 #include "nix/cmd/legacy.hh"
 #include "man-pages.hh"
@@ -48,9 +49,10 @@ static int main_nix_copy_closure(int argc, char ** argv)
         if (sshHost.empty())
             throw UsageError("no host name specified");
 
-        auto remoteUri = "ssh://" + sshHost + (gzip ? "?compress=true" : "");
-        auto to = toMode ? openStore(remoteUri) : openStore();
-        auto from = toMode ? openStore() : openStore(remoteUri);
+        auto remoteConfig = make_ref<LegacySSHStoreConfig>("ssh", sshHost, LegacySSHStoreConfig::Params{});
+        remoteConfig->compress |= gzip;
+        auto to = toMode ? remoteConfig->openStore() : openStore();
+        auto from = toMode ? openStore() : remoteConfig->openStore();
 
         RealisedPath::Set storePaths2;
         for (auto & path : storePaths)

@@ -68,7 +68,7 @@ void processExpr(
                 if (strict)
                     state.forceValueDeep(vRes);
                 std::set<const void *> seen;
-                printAmbiguous(vRes, state.symbols, std::cout, &seen, std::numeric_limits<int>::max());
+                printAmbiguous(state, vRes, std::cout, &seen);
                 std::cout << std::endl;
             }
         } else {
@@ -167,9 +167,9 @@ static int main_nix_instantiate(int argc, char ** argv)
             settings.readOnlyMode = true;
 
         auto store = openStore();
-        auto evalStore = myArgs.evalStoreUrl ? openStore(*myArgs.evalStoreUrl) : store;
+        auto evalStore = myArgs.evalStoreUrl ? openStore(StoreReference{*myArgs.evalStoreUrl}) : store;
 
-        auto state = std::make_unique<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);
+        auto state = std::make_shared<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);
         state->repair = myArgs.repair;
 
         Bindings & autoArgs = *myArgs.getAutoArgs(*state);

@@ -1,19 +1,18 @@
 #include "nix/store/derivations.hh"
 #include "nix/store/globals.hh"
+#include "nix/store/local-gc.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/path.hh"
+#include "nix/util/configuration.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/unix-domain-socket.hh"
 #include "nix/util/signals.hh"
+#include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
+#include "nix/util/file-system.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 
 #include "store-config-private.hh"
-
-#if !defined(__linux__)
-// For shelling out to lsof
-#  include "nix/util/processes.hh"
-#endif
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -67,10 +66,7 @@ void LocalStore::createTempRootsFile()
 
         /* Check whether the garbage collector didn't get in our
            way. */
-        struct stat st;
-        if (fstat(fromDescriptorReadOnly(fdTempRoots->get()), &st) == -1)
-            throw SysError("statting '%1%'", fnTempRoots);
-        if (st.st_size == 0)
+        if (getFileSize(fdTempRoots->get()) == 0)
             break;
 
         /* The garbage collector deleted this file before we could get
@@ -114,10 +110,10 @@ restart:
             *fdRootsSocket = createUnixDomainSocket();
             try {
                 nix::connect(toSocket(fdRootsSocket->get()), socketPath);
-            } catch (SysError & e) {
+            } catch (SystemError & e) {
                 /* The garbage collector may have exited or not
                    created the socket yet, so we need to restart. */
-                if (e.errNo == ECONNREFUSED || e.errNo == ENOENT) {
+                if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
                     debug("GC socket connection refused: %s", e.msg());
                     fdRootsSocket->close();
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -134,10 +130,10 @@ restart:
             readFull(fdRootsSocket->get(), &c, 1);
             assert(c == '1');
             debug("got ack for GC root '%s'", printStorePath(path));
-        } catch (SysError & e) {
+        } catch (SystemError & e) {
             /* The garbage collector may have exited, so we need to
                restart. */
-            if (e.errNo == EPIPE || e.errNo == ECONNRESET) {
+            if (e.is(std::errc::broken_pipe) || e.is(std::errc::connection_reset)) {
                 debug("GC socket disconnected");
                 fdRootsSocket->close();
                 goto restart;
@@ -276,12 +272,13 @@ void LocalStore::findRoots(const Path & path, std::filesystem::file_type type, R
             || e.code() == std::errc::not_a_directory)
             printInfo("cannot read potential root '%1%'", path);
         else
-            throw;
+            throw SystemError(e.code(), "finding GC roots in '%1%'", path);
     }
 
-    catch (SysError & e) {
+    catch (SystemError & e) {
         /* We only ignore permanent failures. */
-        if (e.errNo == EACCES || e.errNo == ENOENT || e.errNo == ENOTDIR)
+        if (e.is(std::errc::permission_denied) || e.is(std::errc::no_such_file_or_directory)
+            || e.is(std::errc::not_a_directory))
             printInfo("cannot read potential root '%1%'", path);
         else
             throw;
@@ -310,151 +307,42 @@ Roots LocalStore::findRoots(bool censor)
     return roots;
 }
 
-/**
- * Key is a mere string because cannot has path with macOS's libc++
- */
-typedef boost::unordered_flat_map<
-    std::string,
-    boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>>,
-    StringViewHash,
-    std::equal_to<>>
-    UncheckedRoots;
-
-static void readProcLink(const std::filesystem::path & file, UncheckedRoots & roots)
+static Roots requestRuntimeRoots(const LocalStoreConfig & config, const std::filesystem::path & socketPath)
 {
-    std::filesystem::path buf;
-    try {
-        buf = std::filesystem::read_symlink(file);
-    } catch (std::filesystem::filesystem_error & e) {
-        if (e.code() == std::errc::no_such_file_or_directory || e.code() == std::errc::permission_denied
-            || e.code() == std::errc::no_such_process)
-            return;
-        throw;
-    }
-    if (buf.is_absolute())
-        roots[buf.string()].emplace(file.string());
-}
+    Roots roots;
 
-static std::string quoteRegexChars(const std::string & raw)
-{
-    static auto specialRegex = boost::regex(R"([.^$\\*+?()\[\]{}|])");
-    return boost::regex_replace(raw, specialRegex, R"(\$&)");
-}
+    auto socket = connect(socketPath);
+    auto socketSource = FdSource(socket.get());
 
-#ifdef __linux__
-static void readFileRoots(const std::filesystem::path & path, UncheckedRoots & roots)
-{
-    try {
-        roots[readFile(path)].emplace(path.string());
-    } catch (SysError & e) {
-        if (e.errNo != ENOENT && e.errNo != EACCES)
-            throw;
-    }
+    while (1) {
+        auto line = socketSource.readLine(true, '\0');
+        if (line == "")
+            break;
+        roots[config.parseStorePath(line)].insert(censored);
+    };
+
+    return roots;
 }
-#endif
 
 void LocalStore::findRuntimeRoots(Roots & roots, bool censor)
 {
-    UncheckedRoots unchecked;
+    Roots unchecked;
 
-    auto procDir = AutoCloseDir{opendir("/proc")};
-    if (procDir) {
-        struct dirent * ent;
-        static const auto digitsRegex = boost::regex(R"(^\d+$)");
-        static const auto mapRegex = boost::regex(R"(^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(/\S+)\s*$)");
-        auto storePathRegex = boost::regex(quoteRegexChars(storeDir) + R"(/[0-9a-z]+[0-9a-zA-Z\+\-\._\?=]*)");
-        while (errno = 0, ent = readdir(procDir.get())) {
-            checkInterrupt();
-            if (boost::regex_match(ent->d_name, digitsRegex)) {
-                try {
-                    readProcLink(fmt("/proc/%s/exe", ent->d_name), unchecked);
-                    readProcLink(fmt("/proc/%s/cwd", ent->d_name), unchecked);
-
-                    auto fdStr = fmt("/proc/%s/fd", ent->d_name);
-                    auto fdDir = AutoCloseDir(opendir(fdStr.c_str()));
-                    if (!fdDir) {
-                        if (errno == ENOENT || errno == EACCES)
-                            continue;
-                        throw SysError("opening %1%", fdStr);
-                    }
-                    struct dirent * fd_ent;
-                    while (errno = 0, fd_ent = readdir(fdDir.get())) {
-                        if (fd_ent->d_name[0] != '.')
-                            readProcLink(fmt("%s/%s", fdStr, fd_ent->d_name), unchecked);
-                    }
-                    if (errno) {
-                        if (errno == ESRCH)
-                            continue;
-                        throw SysError("iterating /proc/%1%/fd", ent->d_name);
-                    }
-                    fdDir.reset();
-
-                    std::filesystem::path mapFile = fmt("/proc/%s/maps", ent->d_name);
-                    auto mapLines = tokenizeString<std::vector<std::string>>(readFile(mapFile.string()), "\n");
-                    for (const auto & line : mapLines) {
-                        auto match = boost::smatch{};
-                        if (boost::regex_match(line, match, mapRegex))
-                            unchecked[match[1]].emplace(mapFile.string());
-                    }
-
-                    auto envFile = fmt("/proc/%s/environ", ent->d_name);
-                    auto envString = readFile(envFile);
-                    auto env_end = boost::sregex_iterator{};
-                    for (auto i = boost::sregex_iterator{envString.begin(), envString.end(), storePathRegex};
-                         i != env_end;
-                         ++i)
-                        unchecked[i->str()].emplace(envFile);
-                } catch (SystemError & e) {
-                    if (errno == ENOENT || errno == EACCES || errno == ESRCH)
-                        continue;
-                    throw;
-                }
-            }
-        }
-        if (errno)
-            throw SysError("iterating /proc");
+    if (config->useRootsDaemon) {
+        experimentalFeatureSettings.require(Xp::LocalOverlayStore);
+        unchecked = requestRuntimeRoots(*config, config->getRootsSocketPath());
+    } else {
+        unchecked = findRuntimeRootsUnchecked(*config);
     }
 
-#if !defined(__linux__)
-    // lsof is really slow on OS X. This actually causes the gc-concurrent.sh test to fail.
-    // See: https://github.com/NixOS/nix/issues/3011
-    // Because of this we disable lsof when running the tests.
-    if (getEnv("_NIX_TEST_NO_LSOF") != "1") {
-        try {
-            boost::regex lsofRegex(R"(^n(/.*)$)");
-            auto lsofLines =
-                tokenizeString<std::vector<std::string>>(runProgram(LSOF, true, {"-n", "-w", "-F", "n"}), "\n");
-            for (const auto & line : lsofLines) {
-                boost::smatch match;
-                if (boost::regex_match(line, match, lsofRegex))
-                    unchecked[match[1].str()].emplace("{lsof}");
-            }
-        } catch (ExecError & e) {
-            /* lsof not installed, lsof failed */
-        }
-    }
-#endif
-
-#ifdef __linux__
-    readFileRoots("/proc/sys/kernel/modprobe", unchecked);
-    readFileRoots("/proc/sys/kernel/fbsplash", unchecked);
-    readFileRoots("/proc/sys/kernel/poweroff_cmd", unchecked);
-#endif
-
-    for (auto & [target, links] : unchecked) {
-        if (!isInStore(target))
+    for (auto & [path, links] : unchecked) {
+        if (!isValidPath(path))
             continue;
-        try {
-            auto path = toStorePath(target).first;
-            if (!isValidPath(path))
-                continue;
-            debug("got additional root '%1%'", printStorePath(path));
-            if (censor)
-                roots[path].insert(censored);
-            else
-                roots[path].insert(links.begin(), links.end());
-        } catch (BadStorePath &) {
-        }
+        debug("got additional root '%1%'", printStorePath(path));
+        if (censor)
+            roots[path].insert(censored);
+        else
+            roots[path].insert(links.begin(), links.end());
     }
 }
 
@@ -463,9 +351,11 @@ struct GCLimitReached
 
 void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
+    const auto & gcSettings = config->getLocalSettings().getGCSettings();
+
     bool shouldDelete = options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific;
-    bool gcKeepOutputs = settings.gcKeepOutputs;
-    bool gcKeepDerivations = settings.gcKeepDerivations;
+    bool keepOutputs = gcSettings.keepOutputs;
+    bool keepDerivations = gcSettings.keepDerivations;
 
     boost::unordered_flat_set<StorePath, std::hash<StorePath>> roots, dead, alive;
 
@@ -489,8 +379,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        (the garbage collector will recurse into deleting the outputs
        or derivers, respectively).  So disable them. */
     if (options.action == GCOptions::gcDeleteSpecific && options.ignoreLiveness) {
-        gcKeepOutputs = false;
-        gcKeepDerivations = false;
+        keepOutputs = false;
+        keepDerivations = false;
     }
 
     if (shouldDelete)
@@ -576,9 +466,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     if (fcntl(fdClient.get(), F_SETFL, fcntl(fdClient.get(), F_GETFL) & ~O_NONBLOCK) == -1)
                         panic("Could not set non-blocking flag on client socket");
 
+                    FdSource source(fdClient.get());
                     while (true) {
                         try {
-                            auto path = readLine(fdClient.get());
+                            auto path = source.readLine();
                             auto storePath = maybeParseStorePath(path);
                             if (storePath) {
                                 debug("got new GC root '%s'", path);
@@ -646,7 +537,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     /* Helper function that deletes a path from the store and throws
        GCLimitReached if we've deleted enough garbage. */
-    auto deleteFromStore = [&](std::string_view baseName) {
+    auto deleteFromStore = [&](std::string_view baseName, bool isKnownPath) {
         Path path = storeDir + "/" + std::string(baseName);
         Path realPath = config->realStoreDir + "/" + std::string(baseName);
 
@@ -666,7 +557,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         results.paths.insert(path);
 
         uint64_t bytesFreed;
-        deleteStorePath(realPath, bytesFreed);
+        deleteStorePath(realPath, bytesFreed, isKnownPath);
 
         results.bytesFreed += bytesFreed;
 
@@ -725,8 +616,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         *path,
                         closure,
                         /* flipDirection */ false,
-                        gcKeepOutputs,
-                        gcKeepDerivations);
+                        keepOutputs,
+                        keepDerivations);
                     for (auto & p : closure)
                         alive.insert(p);
                 } catch (InvalidPath &) {
@@ -767,7 +658,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
                 /* If keep-derivations is set and this is a
                    derivation, then visit the derivation outputs. */
-                if (gcKeepDerivations && path->isDerivation()) {
+                if (keepDerivations && path->isDerivation()) {
                     for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
                         if (maybeOutPath && isValidPath(*maybeOutPath)
                             && queryPathInfo(*maybeOutPath)->deriver == *path)
@@ -775,7 +666,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 }
 
                 /* If keep-outputs is set, then visit the derivers. */
-                if (gcKeepOutputs) {
+                if (keepOutputs) {
                     auto derivers = queryValidDerivers(*path);
                     for (auto & i : derivers)
                         enqueue(i);
@@ -788,7 +679,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             if (shouldDelete) {
                 try {
                     invalidatePathChecked(path);
-                    deleteFromStore(path.to_string());
+                    deleteFromStore(path.to_string(), true);
                     referrersCache.erase(path);
                 } catch (PathInUse & e) {
                     // If we end up here, it's likely a new occurrence
@@ -839,7 +730,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
                     deleteReferrersClosure(*storePath);
                 else
-                    deleteFromStore(name);
+                    deleteFromStore(name, false);
             }
         } catch (GCLimitReached & e) {
         }
@@ -896,14 +787,14 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                accounting.  */
         }
 
-        struct stat st;
-        if (stat(linksDir.c_str(), &st) == -1)
-            throw SysError("statting '%1%'", linksDir);
         int64_t overhead =
 #ifdef _WIN32
             0
 #else
-            st.st_blocks * 512ULL
+            [&] {
+                auto st = stat(linksDir);
+                return st.st_blocks * 512ULL;
+            }()
 #endif
             ;
 
@@ -917,6 +808,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 void LocalStore::autoGC(bool sync)
 {
 #if HAVE_STATVFS
+    const auto & gcSettings = config->getLocalSettings().getGCSettings();
+
     static auto fakeFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
 
     auto getAvail = [this]() -> uint64_t {
@@ -943,14 +836,14 @@ void LocalStore::autoGC(bool sync)
 
         auto now = std::chrono::steady_clock::now();
 
-        if (now < state->lastGCCheck + std::chrono::seconds(settings.minFreeCheckInterval))
+        if (now < state->lastGCCheck + std::chrono::seconds(gcSettings.minFreeCheckInterval))
             return;
 
         auto avail = getAvail();
 
         state->lastGCCheck = now;
 
-        if (avail >= settings.minFree || avail >= settings.maxFree)
+        if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree)
             return;
 
         if (avail > state->availAfterGC * 0.97)
@@ -961,7 +854,7 @@ void LocalStore::autoGC(bool sync)
         std::promise<void> promise;
         future = state->gcFuture = promise.get_future().share();
 
-        std::thread([promise{std::move(promise)}, this, avail, getAvail]() mutable {
+        std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings]() mutable {
             try {
 
                 /* Wake up any threads waiting for the auto-GC to finish. */
@@ -973,7 +866,7 @@ void LocalStore::autoGC(bool sync)
                 });
 
                 GCOptions options;
-                options.maxFreed = settings.maxFree - avail;
+                options.maxFreed = gcSettings.maxFree - avail;
 
                 printInfo("running auto-GC to free %d bytes", options.maxFreed);
 

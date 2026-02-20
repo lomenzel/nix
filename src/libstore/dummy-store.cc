@@ -80,12 +80,6 @@ public:
         subdirs.emplace(baseName, std::move(accessor));
     }
 
-    std::string readFile(const CanonPath & path) override
-    {
-        return callWithAccessorForPath(
-            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.readFile(path); });
-    }
-
     void readFile(const CanonPath & path, Sink & sink, std::function<void(uint64_t)> sizeCallback) override
     {
         return callWithAccessorForPath(path, [&](SourceAccessor & accessor, const CanonPath & path) {
@@ -125,6 +119,11 @@ ref<Store> DummyStoreConfig::openStore() const
     return openDummyStore();
 }
 
+bool DummyStoreConfig::getReadOnly() const
+{
+    return readOnly.get() || StoreConfig::getReadOnly();
+}
+
 struct DummyStoreImpl : DummyStore
 {
     using Config = DummyStoreConfig;
@@ -154,7 +153,7 @@ struct DummyStoreImpl : DummyStore
                 /* compute path info on demand */
                 auto narHash =
                     hashPath({accessor, CanonPath::root}, FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256);
-                auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo{narHash.hash});
+                auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo{*this, narHash.hash});
                 info->narSize = narHash.numBytesDigested;
                 info->ca = ContentAddress{
                     .method = ContentAddressMethod::Raw::Text,
@@ -302,7 +301,7 @@ struct DummyStoreImpl : DummyStore
 
     StorePath writeDerivation(const Derivation & drv, RepairFlag repair = NoRepair) override
     {
-        auto drvPath = ::nix::writeDerivation(*this, drv, repair, /*readonly=*/true);
+        auto drvPath = nix::computeStorePath(*this, drv);
 
         if (!derivations.contains(drvPath) || repair) {
             if (config->readOnly)

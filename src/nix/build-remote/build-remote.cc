@@ -76,8 +76,8 @@ static int main_build_remote(int argc, char ** argv)
             settings.set(name, value);
         }
 
-        auto maxBuildJobs = settings.maxBuildJobs;
-        settings.maxBuildJobs.set("1"); // hack to make tests with local?root= work
+        auto maxBuildJobs = settings.getWorkerSettings().maxBuildJobs;
+        settings.getWorkerSettings().maxBuildJobs.set("1"); // hack to make tests with local?root= work
 
         initPlugins();
 
@@ -94,7 +94,7 @@ static int main_build_remote(int argc, char ** argv)
         std::shared_ptr<Store> sshStore;
         AutoCloseFD bestSlotLock;
 
-        auto machines = getMachines();
+        auto machines = Machine::parseConfig({settings.thisSystem}, settings.getWorkerSettings().builders);
         debug("got %d remote builders", machines.size());
 
         if (machines.empty()) {
@@ -237,7 +237,7 @@ static int main_build_remote(int argc, char ** argv)
                     sshStore = bestMachine->openStore();
                     sshStore->connect();
                 } catch (std::exception & e) {
-                    auto msg = chomp(drainFD(5, false));
+                    auto msg = chomp(drainFD(5, {.block = false}));
                     printError("cannot build on '%s': %s%s", storeUri, e.what(), msg.empty() ? "" : ": " + msg);
                     bestMachine->enabled = false;
                     continue;
@@ -264,8 +264,8 @@ static int main_build_remote(int argc, char ** argv)
             };
             try {
                 setUpdateLock(storeUri);
-            } catch (SysError & e) {
-                if (e.errNo != ENAMETOOLONG)
+            } catch (SystemError & e) {
+                if (!e.is(std::errc::filename_too_long))
                     throw;
                 // Try again hashing the store URL so we have a shorter path
                 auto h = hashString(HashAlgorithm::MD5, storeUri);
@@ -284,7 +284,7 @@ static int main_build_remote(int argc, char ** argv)
             signal(SIGALRM, old);
         }
 
-        auto substitute = settings.buildersUseSubstitutes ? Substitute : NoSubstitute;
+        auto substitute = settings.getWorkerSettings().buildersUseSubstitutes ? Substitute : NoSubstitute;
 
         {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("copying dependencies to '%s'", storeUri));
@@ -333,7 +333,7 @@ static int main_build_remote(int argc, char ** argv)
                             : "");
                 }
                 throw Error(
-                    "build of '%s' on '%s' failed: %s", store->printStorePath(*drvPath), storeUri, failureP->errorMsg);
+                    "build of '%s' on '%s' failed: %s", store->printStorePath(*drvPath), storeUri, failureP->message());
             }
         } else {
             copyClosure(*store, *sshStore, StorePathSet{*drvPath}, NoRepair, NoCheckSigs, substitute);

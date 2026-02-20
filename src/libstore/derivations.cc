@@ -106,7 +106,7 @@ bool BasicDerivation::isBuiltin() const
     return builder.substr(0, 8) == "builtin:";
 }
 
-static auto infoForDerivation(Store & store, const Derivation & drv)
+static auto infoForDerivation(const StoreDirConfig & store, const Derivation & drv)
 {
     auto references = drv.inputSrcs;
     for (auto & i : drv.inputDrvs.map)
@@ -126,18 +126,21 @@ static auto infoForDerivation(Store & store, const Derivation & drv)
     };
 }
 
-StorePath writeDerivation(Store & store, const Derivation & drv, RepairFlag repair, bool readOnly)
+StorePath computeStorePath(const StoreDirConfig & store, const Derivation & drv)
 {
-    if (readOnly || settings.readOnlyMode) {
-        auto [_x, _y, _z, path] = infoForDerivation(store, drv);
-        return path;
-    } else
-        return store.writeDerivation(drv, repair);
+    auto [_suffix, _contents, _references, path] = infoForDerivation(store, drv);
+    return path;
 }
 
 StorePath Store::writeDerivation(const Derivation & drv, RepairFlag repair)
 {
     auto [suffix, contents, references, path] = infoForDerivation(*this, drv);
+
+    /* In case the derivation is already valid, we bail out early since that's
+       faster. But we need to make sure that the derivation has a corresponding
+       temproot. It is added by the remote in addToStoreFromDump, but we'd like
+       to avoid sending a lot of drv contents to the daemon. */
+    addTempRoot(path);
 
     if (isValidPath(path) && !repair)
         return path;
@@ -523,7 +526,6 @@ Derivation parseDerivation(
  */
 static void printString(std::string & res, std::string_view s)
 {
-    res.reserve(res.size() + s.size() * 2 + 2);
     res += '"';
     static constexpr auto chunkSize = 1024;
     std::array<char, 2 * chunkSize + 2> buffer;
@@ -1120,6 +1122,39 @@ static void rewriteDerivation(Store & store, BasicDerivation & drv, const String
     }
 }
 
+bool Derivation::shouldResolve() const
+{
+    /* No input drvs means nothing to resolve. */
+    if (inputDrvs.map.empty())
+        return false;
+
+    auto drvType = type();
+
+    bool typeNeedsResolve = std::visit(
+        overloaded{
+            [&](const DerivationType::InputAddressed & ia) {
+                /* Must resolve if deferred. */
+                return ia.deferred;
+            },
+            [&](const DerivationType::ContentAddressed & ca) {
+                return ca.fixed
+                           /* Can optionally resolve if fixed, which is good
+                              for avoiding unnecessary rebuilds. */
+                           ? experimentalFeatureSettings.isEnabled(Xp::CaDerivations)
+                           /* Must resolve if floating. */
+                           : true;
+            },
+            [&](const DerivationType::Impure &) { return true; },
+        },
+        drvType.raw);
+
+    /* Also need to resolve if any inputs are outputs of dynamic derivations. */
+    bool hasDynamicInputs = std::ranges::any_of(
+        inputDrvs.map.begin(), inputDrvs.map.end(), [](auto & pair) { return !pair.second.childMap.empty(); });
+
+    return typeNeedsResolve || hasDynamicInputs;
+}
+
 std::optional<BasicDerivation> Derivation::tryResolve(Store & store, Store * evalStore) const
 {
     return tryResolve(
@@ -1230,7 +1265,7 @@ static void processDerivationOutputPaths(Store & store, auto && drv, std::string
     std::optional<DrvHash> hashesModulo;
 
     for (auto & [outputName, output] : drv.outputs) {
-        auto envHasRightPath = [&](const StorePath & actual) {
+        auto envHasRightPath = [&](const StorePath & actual, bool isDeferred = false) {
             if constexpr (fillIn) {
                 auto j = drv.env.find(outputName);
                 /* Fill in mode: fill in missing or empty environment
@@ -1248,12 +1283,20 @@ static void processDerivationOutputPaths(Store & store, auto && drv, std::string
                     "derivation has missing environment variable '%s', should be '%s' but is not present",
                     outputName,
                     store.printStorePath(actual));
-            if (j->second != store.printStorePath(actual))
-                throw Error(
-                    "derivation has incorrect environment variable '%s', should be '%s' but is actually '%s'",
-                    outputName,
-                    store.printStorePath(actual),
-                    j->second);
+            if (j->second != store.printStorePath(actual)) {
+                if (isDeferred)
+                    warn(
+                        "derivation has incorrect environment variable '%s', should be '%s' but is actually '%s'\nThis will be an error in future versions of Nix; compatibility of CA derivations will be broken.",
+                        outputName,
+                        store.printStorePath(actual),
+                        j->second);
+                else
+                    throw Error(
+                        "derivation has incorrect environment variable '%s', should be '%s' but is actually '%s'",
+                        outputName,
+                        store.printStorePath(actual),
+                        j->second);
+            }
         };
         auto hash = [&]<typename Output>(const Output & outputVariant) {
             if (!hashesModulo) {
@@ -1287,8 +1330,9 @@ static void processDerivationOutputPaths(Store & store, auto && drv, std::string
                     else
                         /* Validation mode: deferred outputs
                            should have been filled in */
-                        throw Error(
-                            "derivation has incorrect deferred output, should be '%s'", store.printStorePath(outPath));
+                        warn(
+                            "derivation has incorrect deferred output, should be '%s'.\nThis will be an error in future versions of Nix; compatibility of CA derivations will be broken.",
+                            store.printStorePath(outPath));
                 } else {
                     /* Will never happen, based on where
                        `hash` is called. */
@@ -1479,8 +1523,6 @@ adl_serializer<DerivationOutput>::from_json(const json & _json, const Experiment
         throw Error("invalid JSON for derivation output");
     }
 }
-
-static unsigned constexpr expectedJsonVersionDerivation = 4;
 
 void adl_serializer<Derivation>::to_json(json & res, const Derivation & d)
 {

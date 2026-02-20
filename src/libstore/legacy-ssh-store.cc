@@ -3,6 +3,7 @@
 #include "nix/util/archive.hh"
 #include "nix/util/pool.hh"
 #include "nix/store/remote-store.hh"
+#include "nix/store/common-protocol.hh"
 #include "nix/store/serve-protocol.hh"
 #include "nix/store/serve-protocol-connection.hh"
 #include "nix/store/serve-protocol-impl.hh"
@@ -72,7 +73,7 @@ ref<LegacySSHStore::Connection> LegacySSHStore::openConnection()
     TeeSource tee(conn->from, saved);
     try {
         conn->remoteVersion =
-            ServeProto::BasicClientConnection::handshake(conn->to, tee, SERVE_PROTOCOL_VERSION, config->authority.host);
+            ServeProto::BasicClientConnection::handshake(conn->to, tee, ServeProto::latest, config->authority.host);
     } catch (SerialisationError & e) {
         // in.close(): Don't let the remote block on us not writing.
         conn->sshConn->in.close();
@@ -153,7 +154,9 @@ void LegacySSHStore::addToStore(const ValidPathInfo & info, Source & source, Rep
              << (info.deriver ? printStorePath(*info.deriver) : "")
              << info.narHash.to_string(HashFormat::Base16, false);
     ServeProto::write(*this, *conn, info.references);
-    conn->to << info.registrationTime << info.narSize << info.ultimate << info.sigs << renderContentAddress(info.ca);
+    conn->to << info.registrationTime << info.narSize << info.ultimate;
+    ServeProto::write(*this, *conn, info.sigs);
+    conn->to << renderContentAddress(info.ca);
     try {
         copyNAR(source, conn->to);
     } catch (...) {
@@ -180,9 +183,9 @@ void LegacySSHStore::narFromPath(const StorePath & path, std::function<void(Sour
 static ServeProto::BuildOptions buildSettings()
 {
     return {
-        .maxSilentTime = settings.maxSilentTime,
-        .buildTimeout = settings.buildTimeout,
-        .maxLogSize = settings.maxLogSize,
+        .maxSilentTime = settings.getWorkerSettings().maxSilentTime,
+        .buildTimeout = settings.getWorkerSettings().buildTimeout,
+        .maxLogSize = settings.getWorkerSettings().maxLogSize,
         .nrRepeats = 0, // buildRepeat hasn't worked for ages anyway
         .enforceDeterminism = 0,
         .keepFailed = settings.keepFailed,
@@ -241,13 +244,11 @@ void LegacySSHStore::buildPaths(
 
     conn->to.flush();
 
-    auto status = readInt(conn->from);
-    if (!BuildResult::Success::statusIs(status)) {
-        BuildResult::Failure failure{
-            .status = (BuildResult::Failure::Status) status,
-        };
-        conn->from >> failure.errorMsg;
-        throw Error(failure.status, std::move(failure.errorMsg));
+    auto status = CommonProto::Serialise<BuildResultStatus>::read(*this, {conn->from});
+    if (auto * failure = std::get_if<BuildResultFailureStatus>(&status)) {
+        std::string errorMsg;
+        conn->from >> errorMsg;
+        throw BuildError(*failure, std::move(errorMsg));
     }
 }
 
@@ -289,7 +290,7 @@ void LegacySSHStore::connect()
 unsigned int LegacySSHStore::getProtocol()
 {
     auto conn(connections->get());
-    return conn->remoteVersion;
+    return conn->remoteVersion.toWire();
 }
 
 pid_t LegacySSHStore::getConnectionPid()

@@ -112,9 +112,9 @@ std::tuple<StorePath, Hash> prefetchFile(
             if (executable)
                 mode = 0700;
 
-            AutoCloseFD fd = toDescriptor(open(tmpFile.string().c_str(), O_WRONLY | O_CREAT | O_EXCL, mode));
+            AutoCloseFD fd = openNewFileForWrite(tmpFile, mode, {.truncateExisting = false});
             if (!fd)
-                throw SysError("creating temporary file '%s'", tmpFile);
+                throw SysError("creating temporary file %s", PathFmt(tmpFile));
 
             FdSink sink(fd.get());
 
@@ -126,9 +126,9 @@ std::tuple<StorePath, Hash> prefetchFile(
         /* Optionally unpack the file. */
         if (unpack) {
             Activity act(*logger, lvlChatty, actUnknown, fmt("unpacking '%s'", url.to_string()));
-            auto unpacked = (tmpDir.path() / "unpacked").string();
+            auto unpacked = tmpDir.path() / "unpacked";
             createDirs(unpacked);
-            unpackTarfile(tmpFile.string(), unpacked);
+            unpackTarfile(tmpFile, unpacked);
 
             auto entries = DirectoryIterator{unpacked};
             /* If the archive unpacks to a single file/directory, then use
@@ -203,7 +203,7 @@ static int main_nix_prefetch_url(int argc, char ** argv)
         setLogFormat("bar");
 
         auto store = openStore();
-        auto state = std::make_unique<EvalState>(myArgs.lookupPath, store, fetchSettings, evalSettings);
+        auto state = std::make_shared<EvalState>(myArgs.lookupPath, store, fetchSettings, evalSettings);
 
         Bindings & autoArgs = *myArgs.getAutoArgs(*state);
 

@@ -6,7 +6,6 @@
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/realisation.hh"
-#include "nix/store/nar-info.hh"
 #include "nix/store/references.hh"
 #include "nix/util/callback.hh"
 #include "nix/util/topo-sort.hh"
@@ -16,12 +15,9 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/store/keys.hh"
-#include "nix/util/url.hh"
 #include "nix/util/users.hh"
-#include "nix/store/store-open.hh"
 #include "nix/store/store-registration.hh"
 
-#include <iostream>
 #include <algorithm>
 #include <cstring>
 
@@ -33,7 +29,6 @@
 #include <unistd.h>
 #include <utime.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -74,11 +69,18 @@ std::string LocalStoreConfig::doc()
         ;
 }
 
-Path LocalBuildStoreConfig::getBuildDir() const
+const LocalSettings & LocalBuildStoreConfig::getLocalSettings() const
+
 {
-    return settings.buildDir.get().has_value() ? *settings.buildDir.get()
-           : buildDir.get().has_value()        ? *buildDir.get()
-                                               : stateDir.get() + "/builds";
+    return settings.getLocalSettings();
+}
+
+std::filesystem::path LocalBuildStoreConfig::getBuildDir() const
+{
+    auto & bd = getLocalSettings().buildDir.get();
+    return bd.has_value()               ? *bd
+           : buildDir.get().has_value() ? *buildDir.get()
+                                        : std::filesystem::path{stateDir.get()} / "builds";
 }
 
 ref<Store> LocalStore::Config::openStore() const
@@ -110,8 +112,6 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryAllRealisedOutputs;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
-    SQLiteStmt QueryRealisationReferences;
-    SQLiteStmt AddRealisationReference;
 };
 
 LocalStore::LocalStore(ref<const Config> config)
@@ -142,10 +142,9 @@ LocalStore::LocalStore(ref<const Config> config)
     createDirs(tempRootsDir);
     createDirs(dbDir);
     Path gcRootsDir = config->stateDir + "/gcroots";
-    if (!pathExists(gcRootsDir)) {
-        createDirs(gcRootsDir);
-        replaceSymlink(profilesDir, gcRootsDir + "/profiles");
-    }
+    const auto & localSettings = config->getLocalSettings();
+    const auto & gcSettings = localSettings.getGCSettings();
+    createDirs(gcRootsDir);
 
     for (auto & perUserDir : {profilesDir + "/per-user", gcRootsDir + "/per-user"}) {
         createDirs(perUserDir);
@@ -160,38 +159,36 @@ LocalStore::LocalStore(ref<const Config> config)
 #ifndef _WIN32
     /* Optionally, create directories and set permissions for a
        multi-user install. */
-    if (isRootUser() && settings.buildUsersGroup != "") {
+    if (isRootUser() && localSettings.buildUsersGroup != "") {
         mode_t perm = 01775;
 
-        struct group * gr = getgrnam(settings.buildUsersGroup.get().c_str());
+        struct group * gr = getgrnam(localSettings.buildUsersGroup.get().c_str());
         if (!gr)
             printError(
-                "warning: the group '%1%' specified in 'build-users-group' does not exist", settings.buildUsersGroup);
+                "warning: the group '%1%' specified in 'build-users-group' does not exist",
+                localSettings.buildUsersGroup);
         else if (!config->readOnly) {
-            struct stat st;
-            if (stat(config->realStoreDir.get().c_str(), &st))
-                throw SysError("getting attributes of path '%1%'", config->realStoreDir);
+            auto st = stat(config->realStoreDir.get());
 
             if (st.st_uid != 0 || st.st_gid != gr->gr_gid || (st.st_mode & ~S_IFMT) != perm) {
                 if (chown(config->realStoreDir.get().c_str(), 0, gr->gr_gid) == -1)
                     throw SysError("changing ownership of path '%1%'", config->realStoreDir);
-                if (chmod(config->realStoreDir.get().c_str(), perm) == -1)
-                    throw SysError("changing permissions on path '%1%'", config->realStoreDir);
+                chmod(config->realStoreDir.get(), perm);
             }
         }
     }
 #endif
 
     /* Ensure that the store and its parents are not symlinks. */
-    if (!settings.allowSymlinkedStore) {
+    if (!localSettings.allowSymlinkedStore) {
         std::filesystem::path path = config->realStoreDir.get();
         std::filesystem::path root = path.root_path();
         while (path != root) {
             if (std::filesystem::is_symlink(path))
                 throw Error(
-                    "the path '%1%' is a symlink; "
+                    "the path %1% is a symlink; "
                     "this is not allowed for the Nix store and its parent directories",
-                    path);
+                    PathFmt(path));
             path = path.parent_path();
         }
     }
@@ -201,8 +198,8 @@ LocalStore::LocalStore(ref<const Config> config)
        needed, we reserve some dummy space that we can free just
        before doing a garbage collection. */
     try {
-        struct stat st;
-        if (stat(reservedPath.c_str(), &st) == -1 || st.st_size != settings.reservedSize) {
+        auto st = maybeStat(reservedPath);
+        if (!st || st->st_size != gcSettings.reservedSize) {
             AutoCloseFD fd = toDescriptor(open(
                 reservedPath.c_str(),
                 O_WRONLY | O_CREAT
@@ -213,16 +210,16 @@ LocalStore::LocalStore(ref<const Config> config)
                 0600));
             int res = -1;
 #if HAVE_POSIX_FALLOCATE
-            res = posix_fallocate(fd.get(), 0, settings.reservedSize);
+            res = posix_fallocate(fd.get(), 0, gcSettings.reservedSize);
 #endif
             if (res == -1) {
-                writeFull(fd.get(), std::string(settings.reservedSize, 'X'));
+                writeFull(fd.get(), std::string(gcSettings.reservedSize, 'X'));
                 [[gnu::unused]] auto res2 =
 
 #ifdef _WIN32
                     SetEndOfFile(fd.get())
 #else
-                    ftruncate(fd.get(), settings.reservedSize)
+                    ftruncate(fd.get(), gcSettings.reservedSize)
 #endif
                     ;
             }
@@ -236,8 +233,8 @@ LocalStore::LocalStore(ref<const Config> config)
         Path globalLockPath = dbDir + "/big-lock";
         try {
             globalLock = openLockFile(globalLockPath.c_str(), true);
-        } catch (SysError & e) {
-            if (e.errNo == EACCES || e.errNo == EPERM) {
+        } catch (SystemError & e) {
+            if (e.is(std::errc::permission_denied) || e.is(std::errc::operation_not_permitted)) {
                 e.addTrace(
                     {},
                     "This command may have been run as non-root in a single-user Nix installation,\n"
@@ -390,21 +387,6 @@ LocalStore::LocalStore(ref<const Config> config)
                     where drvPath = ?
                     ;
             )");
-        state->stmts->QueryRealisationReferences.create(
-            state->db,
-            R"(
-                select drvPath, outputName from Realisations
-                    join RealisationsRefs on realisationReference = Realisations.id
-                    where referrer = ?;
-            )");
-        state->stmts->AddRealisationReference.create(
-            state->db,
-            R"(
-                insert or replace into RealisationsRefs (referrer, realisationReference)
-                values (
-                    (select id from Realisations where drvPath = ? and outputName = ?),
-                    (select id from Realisations where drvPath = ? and outputName = ?));
-            )");
     }
 }
 
@@ -424,9 +406,26 @@ AutoCloseFD LocalStore::openGCLock()
     return toDescriptor(fdGCLock);
 }
 
-void LocalStore::deleteStorePath(const Path & path, uint64_t & bytesFreed)
+void LocalStore::deleteStorePath(const Path & path, uint64_t & bytesFreed, bool isKnownPath)
 {
-    deletePath(path, bytesFreed);
+    try {
+        deletePath(path, bytesFreed);
+    } catch (SystemError & e) {
+        if (config->ignoreGcDeleteFailure) {
+            logWarning(
+                {.msg = HintFmt(
+                     isKnownPath ? "ignoring failure to remove store path '%1%': %2%"
+                                 : "ignoring failure to remove garbage in store directory '%1%': %2%",
+                     path,
+                     e.info().msg)});
+        } else {
+            e.addTrace(
+                {},
+                isKnownPath ? "While deleting store path '%1%'" : "While deleting garbage in store directory '%1%'",
+                path);
+            throw;
+        }
+    }
 }
 
 LocalStore::~LocalStore()
@@ -455,6 +454,11 @@ LocalStore::~LocalStore()
     }
 }
 
+std::filesystem::path LocalStoreConfig::getRootsSocketPath() const
+{
+    return std::filesystem::path(stateDir.get()) / "gc-roots-socket" / "socket";
+}
+
 StoreReference LocalStoreConfig::getReference() const
 {
     auto params = getQueryParams();
@@ -469,6 +473,11 @@ StoreReference LocalStoreConfig::getReference() const
             },
         .params = std::move(params),
     };
+}
+
+bool LocalStoreConfig::getReadOnly() const
+{
+    return readOnly.get() || StoreConfig::getReadOnly();
 }
 
 int LocalStore::getSchema()
@@ -498,7 +507,7 @@ void LocalStore::openDB(State & state, bool create)
     auto openMode = config->readOnly ? SQLiteOpenMode::Immutable
                     : create         ? SQLiteOpenMode::Normal
                                      : SQLiteOpenMode::NoCreate;
-    state.db = SQLite(std::filesystem::path(dbDir) / "db.sqlite", openMode);
+    state.db = SQLite(std::filesystem::path(dbDir) / "db.sqlite", {.mode = openMode, .useWAL = settings.useSQLiteWAL});
 
 #ifdef __CYGWIN__
     /* The cygwin version of sqlite3 has a patch which calls
@@ -517,7 +526,7 @@ void LocalStore::openDB(State & state, bool create)
        should be safe enough.  If the user asks for it, don't sync at
        all.  This can cause database corruption if the system
        crashes. */
-    std::string syncMode = settings.fsyncMetadata ? "normal" : "off";
+    std::string syncMode = config->getLocalSettings().fsyncMetadata ? "normal" : "off";
     db.exec("pragma synchronous = " + syncMode);
 
     /* Set the SQLite journal mode.  WAL mode is fastest, so it's the
@@ -636,7 +645,8 @@ void LocalStore::registerDrvOutput(const Realisation & info)
                 auto combinedSignatures = oldR->signatures;
                 combinedSignatures.insert(info.signatures.begin(), info.signatures.end());
                 state->stmts->UpdateRealisedOutput
-                    .use()(concatStringsSep(" ", combinedSignatures))(info.id.strHash())(info.id.outputName)
+                    .use()(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))(info.id.strHash())(
+                        info.id.outputName)
                     .exec();
             } else {
                 throw Error(
@@ -651,26 +661,7 @@ void LocalStore::registerDrvOutput(const Realisation & info)
         } else {
             state->stmts->RegisterRealisedOutput
                 .use()(info.id.strHash())(info.id.outputName)(printStorePath(info.outPath))(
-                    concatStringsSep(" ", info.signatures))
-                .exec();
-        }
-        for (auto & [outputId, depPath] : info.dependentRealisations) {
-            auto localRealisation = queryRealisationCore_(*state, outputId);
-            if (!localRealisation)
-                throw Error(
-                    "unable to register the derivation '%s' as it "
-                    "depends on the non existent '%s'",
-                    info.id.to_string(),
-                    outputId.to_string());
-            if (localRealisation->second.outPath != depPath)
-                throw Error(
-                    "unable to register the derivation '%s' as it "
-                    "depends on a realisation of '%s' that doesn’t"
-                    "match what we have locally",
-                    info.id.to_string(),
-                    outputId.to_string());
-            state->stmts->AddRealisationReference
-                .use()(info.id.strHash())(info.id.outputName)(outputId.strHash())(outputId.outputName)
+                    concatStringsSep(" ", Signature::toStrings(info.signatures)))
                 .exec();
         }
     });
@@ -683,7 +674,7 @@ void LocalStore::cacheDrvOutputMapping(
         [&]() { state.stmts->AddDerivationOutput.use()(deriver)(outputName) (printStorePath(output)).exec(); });
 }
 
-uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info, bool checkOutputs)
+uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
 {
     if (info.ca.has_value() && !info.isContentAddressed(*this))
         throw Error(
@@ -695,7 +686,8 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info, boo
             info.registrationTime == 0 ? time(0) : info.registrationTime)(
             info.deriver ? printStorePath(*info.deriver) : "",
             (bool) info.deriver)(info.narSize, info.narSize != 0)(info.ultimate ? 1 : 0, info.ultimate)(
-            concatStringsSep(" ", info.sigs), !info.sigs.empty())(renderContentAddress(info.ca), (bool) info.ca)
+            concatStringsSep(" ", Signature::toStrings(info.sigs)),
+            !info.sigs.empty())(renderContentAddress(info.ca), (bool) info.ca)
         .exec();
     uint64_t id = state.db.getLastInsertedRowId();
 
@@ -704,17 +696,16 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info, boo
        efficiently query whether a path is an output of some
        derivation. */
     if (info.path.isDerivation()) {
-        auto drv = readInvalidDerivation(info.path);
+        auto parsedDrv = readInvalidDerivation(info.path);
 
         /* Verify that the output paths in the derivation are correct
            (i.e., follow the scheme for computing output paths from
            derivations).  Note that if this throws an error, then the
            DB transaction is rolled back, so the path validity
            registration above is undone. */
-        if (checkOutputs)
-            drv.checkInvariants(*this, info.path);
+        parsedDrv.checkInvariants(*this, info.path);
 
-        for (auto & i : drv.outputsAndOptPaths(*this)) {
+        for (auto & i : parsedDrv.outputsAndOptPaths(*this)) {
             /* Floating CA derivations have indeterminate output paths until
                they are built, so don't register anything in that case */
             if (i.second.second)
@@ -757,7 +748,7 @@ std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoInternal(State & s
         throw Error("invalid-path entry for '%s': %s", printStorePath(path), e.what());
     }
 
-    auto info = std::make_shared<ValidPathInfo>(path, narHash);
+    auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo(*this, narHash));
 
     info->id = id;
 
@@ -774,7 +765,7 @@ std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoInternal(State & s
 
     s = (const char *) sqlite3_column_text(state.stmts->QueryPathInfo, 6);
     if (s)
-        info->sigs = tokenizeString<StringSet>(s, " ");
+        info->sigs = Signature::parseMany(tokenizeString<StringSet>(s, " "));
 
     s = (const char *) sqlite3_column_text(state.stmts->QueryPathInfo, 7);
     if (s)
@@ -794,7 +785,8 @@ void LocalStore::updatePathInfo(State & state, const ValidPathInfo & info)
 {
     state.stmts->UpdatePathInfo
         .use()(info.narSize, info.narSize != 0)(info.narHash.to_string(HashFormat::Base16, true))(
-            info.ultimate ? 1 : 0, info.ultimate)(concatStringsSep(" ", info.sigs), !info.sigs.empty())(
+            info.ultimate ? 1 : 0,
+            info.ultimate)(concatStringsSep(" ", Signature::toStrings(info.sigs)), !info.sigs.empty())(
             renderContentAddress(info.ca), (bool) info.ca)(printStorePath(info.path))
         .exec();
 }
@@ -904,40 +896,6 @@ std::optional<StorePath> LocalStore::queryPathFromHashPart(const std::string & h
     });
 }
 
-StorePathSet LocalStore::querySubstitutablePaths(const StorePathSet & paths)
-{
-    if (!settings.useSubstitutes)
-        return StorePathSet();
-
-    StorePathSet remaining;
-    for (auto & i : paths)
-        remaining.insert(i);
-
-    StorePathSet res;
-
-    for (auto & sub : getDefaultSubstituters()) {
-        if (remaining.empty())
-            break;
-        if (sub->storeDir != storeDir)
-            continue;
-        if (!sub->config.wantMassQuery)
-            continue;
-
-        auto valid = sub->queryValidPaths(remaining);
-
-        StorePathSet remaining2;
-        for (auto & path : remaining)
-            if (valid.count(path))
-                res.insert(path);
-            else
-                remaining2.insert(path);
-
-        std::swap(remaining, remaining2);
-    }
-
-    return res;
-}
-
 void LocalStore::registerValidPath(const ValidPathInfo & info)
 {
     registerValidPaths({{info.path, info}});
@@ -950,7 +908,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
        be fsync-ed.  So some may want to fsync them before registering
        the validity, at the expense of some speed of the path
        registering operation. */
-    if (settings.syncBeforeRegistering)
+    if (config->getLocalSettings().syncBeforeRegistering)
         sync();
 #endif
 
@@ -965,7 +923,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
             if (isValidPath_(*state, i.path))
                 updatePathInfo(*state, i);
             else
-                addValidPath(*state, i, false);
+                addValidPath(*state, i);
             paths.insert(i.path);
         }
 
@@ -974,15 +932,6 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
             for (auto & j : i.references)
                 state->stmts->AddReference.use()(referrer)(queryValidPathId(*state, j)).exec();
         }
-
-        /* Check that the derivation outputs are correct.  We can't do
-           this in addValidPath() above, because the references might
-           not be valid yet. */
-        for (auto & [_, i] : infos)
-            if (i.path.isDerivation()) {
-                // FIXME: inefficient; we already loaded the derivation in addValidPath().
-                readInvalidDerivation(i.path).checkInvariants(*this, i.path);
-            }
 
         /* Do a topological sort of the paths.  This will throw an
            error if a cycle is detected and roll back the
@@ -1084,7 +1033,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                 TeeSource wrapperSource{source, hashSink};
 
                 narRead = true;
-                restorePath(realPath, wrapperSource, settings.fsyncStorePaths);
+                restorePath(realPath, wrapperSource, config->getLocalSettings().fsyncStorePaths);
 
                 auto hashResult = hashSink.finish();
 
@@ -1140,11 +1089,11 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
                 autoGC();
 
-                canonicalisePathMetaData(realPath);
+                canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
 
                 optimisePath(realPath, repair); // FIXME: combine with hashPath()
 
-                if (settings.fsyncStorePaths) {
+                if (config->getLocalSettings().fsyncStorePaths) {
                     recursiveSync(realPath);
                     syncParent(realPath);
                 }
@@ -1172,6 +1121,7 @@ StorePath LocalStore::addToStoreFromDump(
     /* For computing the store path. */
     auto hashSink = std::make_unique<HashSink>(hashAlgo);
     TeeSource source{source0, *hashSink};
+    const LocalSettings & localSettings = config->getLocalSettings();
 
     /* Read the source path into memory, but only if it's up to
        narBufferSize bytes. If it's larger, write it to a temporary
@@ -1195,10 +1145,10 @@ StorePath LocalStore::addToStoreFromDump(
     /* Fill out buffer, and decide whether we are working strictly in
        memory based on whether we break out because the buffer is full
        or the original source is empty */
-    while (dump.size() < settings.narBufferSize) {
+    while (dump.size() < localSettings.narBufferSize) {
         auto oldSize = dump.size();
         constexpr size_t chunkSize = 65536;
-        auto want = std::min(chunkSize, settings.narBufferSize - oldSize);
+        auto want = std::min(chunkSize, localSettings.narBufferSize - oldSize);
         if (auto tmp = realloc(dumpBuffer.get(), oldSize + want)) {
             dumpBuffer.release();
             dumpBuffer.reset((char *) tmp);
@@ -1235,7 +1185,7 @@ StorePath LocalStore::addToStoreFromDump(
         delTempDir = std::make_unique<AutoDelete>(tempDir);
         tempPath = tempDir / "x";
 
-        restorePath(tempPath.string(), bothSource, dumpMethod, settings.fsyncStorePaths);
+        restorePath(tempPath.string(), bothSource, dumpMethod, localSettings.fsyncStorePaths);
 
         dumpBuffer.reset();
         dump = {};
@@ -1279,7 +1229,7 @@ StorePath LocalStore::addToStoreFromDump(
                 switch (fim) {
                 case FileIngestionMethod::Flat:
                 case FileIngestionMethod::NixArchive:
-                    restorePath(realPath, dumpSource, (FileSerialisationMethod) fim, settings.fsyncStorePaths);
+                    restorePath(realPath, dumpSource, (FileSerialisationMethod) fim, localSettings.fsyncStorePaths);
                     break;
                 case FileIngestionMethod::Git:
                     // doesn't correspond to serialization method, so
@@ -1300,11 +1250,12 @@ StorePath LocalStore::addToStoreFromDump(
                 narHash = narSink.finish();
             }
 
-            canonicalisePathMetaData(realPath); // FIXME: merge into restorePath
+            canonicalisePathMetaData(
+                realPath, {NIX_WHEN_SUPPORT_ACLS(localSettings.ignoredAcls)}); // FIXME: merge into restorePath
 
             optimisePath(realPath, repair);
 
-            if (settings.fsyncStorePaths) {
+            if (localSettings.fsyncStorePaths) {
                 recursiveSync(realPath);
                 syncParent(realPath);
             }
@@ -1381,15 +1332,16 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
         for (auto & link : DirectoryIterator{linksDir}) {
             checkInterrupt();
             auto name = link.path().filename();
-            printMsg(lvlTalkative, "checking contents of %s", name);
+            printMsg(lvlTalkative, "checking contents of %s", PathFmt(name));
             std::string hash =
                 hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
                     .first.to_string(HashFormat::Nix32, false);
             if (hash != name.string()) {
-                printError("link %s was modified! expected hash %s, got '%s'", link.path(), name, hash);
+                printError(
+                    "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), name.string(), hash);
                 if (repair) {
                     std::filesystem::remove(link.path());
-                    printInfo("removed link %s", link.path());
+                    printInfo("removed link %s", PathFmt(link.path()));
                 } else {
                     errors = true;
                 }
@@ -1551,7 +1503,7 @@ void LocalStore::verifyPath(
 
 unsigned int LocalStore::getProtocol()
 {
-    return PROTOCOL_VERSION;
+    return WorkerProto::latest.number.toWire();
 }
 
 std::optional<TrustedFlag> LocalStore::isTrustedClient()
@@ -1564,7 +1516,7 @@ void LocalStore::vacuumDB()
     _state->lock()->db.exec("vacuum");
 }
 
-void LocalStore::addSignatures(const StorePath & storePath, const StringSet & sigs)
+void LocalStore::addSignatures(const StorePath & storePath, const std::set<Signature> & sigs)
 {
     retrySQLite<void>([&]() {
         auto state(_state->lock());
@@ -1595,7 +1547,7 @@ LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & i
         {realisationDbId,
          UnkeyedRealisation{
              .outPath = outputPath,
-             .signatures = signatures,
+             .signatures = Signature::parseMany(signatures),
          }}};
 }
 
@@ -1605,21 +1557,6 @@ std::optional<const UnkeyedRealisation> LocalStore::queryRealisation_(LocalStore
     if (!maybeCore)
         return std::nullopt;
     auto [realisationDbId, res] = *maybeCore;
-
-    std::map<DrvOutput, StorePath> dependentRealisations;
-    auto useRealisationRefs(state.stmts->QueryRealisationReferences.use()(realisationDbId));
-    while (useRealisationRefs.next()) {
-        auto depId = DrvOutput{
-            Hash::parseAnyPrefixed(useRealisationRefs.getStr(0)),
-            useRealisationRefs.getStr(1),
-        };
-        auto dependentRealisation = queryRealisationCore_(state, depId);
-        assert(dependentRealisation); // Enforced by the db schema
-        auto outputPath = dependentRealisation->second.outPath;
-        dependentRealisations.insert({depId, outputPath});
-    }
-
-    res.dependentRealisations = dependentRealisations;
 
     return {res};
 }
@@ -1659,7 +1596,7 @@ void LocalStore::addBuildLog(const StorePath & drvPath, std::string_view log)
 
     auto tmpFile = fmt("%s.tmp.%d", logPath, getpid());
 
-    writeFile(tmpFile, compress("bzip2", log));
+    writeFile(tmpFile, compress(CompressionAlgo::bzip2, log));
 
     std::filesystem::rename(tmpFile, logPath);
 }

@@ -33,6 +33,7 @@ class PathInfoTestV2 : public CharacterizationTest, public LibStoreTest
 static UnkeyedValidPathInfo makeEmpty()
 {
     return {
+        "/nix/store",
         Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
     };
 }
@@ -65,7 +66,10 @@ static ValidPathInfo makeFullKeyed(const Store & store, bool includeImpureInfo)
         };
         info.registrationTime = 23423;
         info.ultimate = true;
-        info.sigs = {"asdf", "qwer"};
+        info.sigs = {
+            Signature{.keyName = "asdf", .sig = std::string(64, '\0')},
+            Signature{.keyName = "qwer", .sig = std::string(64, '\0')},
+        };
     }
     return info;
 }

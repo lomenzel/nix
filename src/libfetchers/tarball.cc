@@ -114,15 +114,22 @@ static DownloadTarballResult downloadTarball_(
     // it is not in fact a tarball.
     if (url.scheme == "file") {
         std::filesystem::path localPath = renderUrlPathEnsureLegal(url.path);
+        if (!localPath.is_absolute()) {
+            throw Error(
+                "tarball '%s' must use an absolute path. "
+                "The 'file' scheme does not support relative paths.",
+                url);
+        }
         if (!exists(localPath)) {
-            throw Error("tarball '%s' does not exist.", localPath);
+            throw Error("tarball %s does not exist.", PathFmt(localPath));
         }
         if (is_directory(localPath)) {
             if (exists(localPath / ".git")) {
                 throw Error(
-                    "tarball '%s' is a git repository, not a tarball. Please use `git+file` as the scheme.", localPath);
+                    "tarball %s is a git repository, not a tarball. Please use `git+file` as the scheme.",
+                    PathFmt(localPath));
             }
-            throw Error("tarball '%s' is a directory, not a file.", localPath);
+            throw Error("tarball %s is a directory, not a file.", PathFmt(localPath));
         }
     }
 
@@ -170,7 +177,8 @@ static DownloadTarballResult downloadTarball_(
            the entire file to disk so libarchive can access it
            in random-access mode. */
         auto [fdTemp, path] = createTempFile("nix-zipfile");
-        cleanupTemp.reset(path);
+        cleanupTemp.cancel();
+        cleanupTemp = {path};
         debug("downloading '%s' into '%s'...", url, path);
         {
             FdSink sink(fdTemp.get());
