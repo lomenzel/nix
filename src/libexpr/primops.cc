@@ -4152,13 +4152,17 @@ static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value
 
         BindingsBuilder b = state.buildBindings(3);
         b.alloc("_expr").mkString("primopApp", state.mem);
-        b.alloc("primop").mkString(cur->primOp()->name, state.mem);
 
         ListBuilder argsList = state.buildList(appliedArgs.size());
         for (const auto &[i, v] : enumerate(argsList)) {
             v = appliedArgs[i];
         }
-        b.alloc("appliedArgs").mkList(argsList);
+
+        BindingsBuilder value = state.buildBindings(2);
+        value.alloc("primop").mkString(cur->primOp()->name, state.mem);
+        value.alloc("appliedArgs").mkList(argsList);
+
+        b.alloc("value").mkAttrs(value);
 
         v.mkAttrs(b);
         return;
