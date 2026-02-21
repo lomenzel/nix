@@ -3757,8 +3757,7 @@ static RegisterPrimOp primop_map({
 });
 static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * env, uint32_t level);
 
-BindingsBuilder
-reifyParams(EvalState & state, std::optional<Formals> params, Symbol identifier, Env * env, uint32_t level)
+BindingsBuilder reifyParams(EvalState & state, std::optional<Formals> params, Symbol identifier, Env * env, uint32_t level)
 {
 
     if (params) {
@@ -3807,9 +3806,43 @@ BindingsBuilder reifyAttrs(EvalState & state, ExprAttrs * eAttrs, Env * env, int
         BindingsBuilder attrsSet = state.buildBindings(attrs.size());
 
         for (auto & kv : attrs) {
-            BindingsBuilder attrValue =
-                appendBindingExpr(state, kv.second.e, env, eAttrs->recursive ? level + 1 : level);
-            attrsSet.alloc(state.symbols[kv.first]).mkAttrs(attrValue);
+            int attrLevel = eAttrs->recursive ? level + 1 : level;
+
+            if (kv.second.kind == ExprAttrs::AttrDef::Kind::InheritedFrom && eAttrs->inheritFromExprs) {
+                auto & select = dynamic_cast<ExprSelect &>(*kv.second.e);
+                auto & from = dynamic_cast<ExprInheritFrom &>(*select.e);
+                Expr * sourceExpr = (*eAttrs->inheritFromExprs)[from.displ];
+
+                BindingsBuilder attrValue = state.buildBindings(2);
+                attrValue.alloc("_expr").mkString("select", state.mem);
+
+                auto selectValue = state.buildBindings(2);
+
+                std::span<const AttrName> path = select.getAttrPath();
+                ListBuilder list = state.buildList(path.size());
+                for (const auto & [i, v] : enumerate(list)) {
+                    AttrName aName = path[i];
+                    if (aName.expr) {
+                        BindingsBuilder e = appendBindingExpr(state, aName.expr, env, attrLevel);
+                        (v = state.allocValue())->mkAttrs(e);
+                    } else {
+                        BindingsBuilder pName = state.buildBindings(2);
+                        pName.alloc("_expr").mkString("attrName", state.mem);
+                        pName.alloc("value").mkString(state.symbols[aName.symbol], state.mem);
+                        (v = state.allocValue())->mkAttrs(pName);
+                    }
+                }
+                selectValue.alloc("path").mkList(list);
+
+                BindingsBuilder sourceReified = appendBindingExpr(state, sourceExpr, env, attrLevel);
+                selectValue.alloc("expression").mkAttrs(sourceReified);
+
+                attrValue.alloc("value").mkAttrs(selectValue);
+                attrsSet.alloc(state.symbols[kv.first]).mkAttrs(attrValue);
+            } else {
+                BindingsBuilder attrValue = appendBindingExpr(state, kv.second.e, env, attrLevel);
+                attrsSet.alloc(state.symbols[kv.first]).mkAttrs(attrValue);
+            }
         }
         value.alloc("attrs").mkAttrs(attrsSet);
     }
@@ -3857,7 +3890,7 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
             }
 
             value.alloc("closureEnvValue").mkThunk(newEnv, eVar);
-            value.alloc("name").mkString(state.symbols[eVar->name], state.mem);
+                value.alloc("name").mkString(state.symbols[eVar->name], state.mem);
             b.alloc("value").mkAttrs(value);
         } else {
             BindingsBuilder value = state.buildBindings(1);
@@ -4103,6 +4136,30 @@ static void prim_reify(EvalState & state, const PosIdx pos, Value ** args, Value
         BindingsBuilder b = state.buildBindings(2);
         b.alloc("_expr").mkString("primop", state.mem);
         b.alloc("value").mkString(args[0]->primOp()->name, state.mem);
+        v.mkAttrs(b);
+        return;
+    }
+
+    if (args[0]->isPrimOpApp()) {
+        std::vector<Value *> appliedArgs;
+        Value *cur = args[0];
+
+        while (cur->isPrimOpApp()) {
+            appliedArgs.push_back(cur->primOpApp().right);
+            cur = cur->primOpApp().left;
+        }
+        std::reverse(appliedArgs.begin(), appliedArgs.end());
+
+        BindingsBuilder b = state.buildBindings(3);
+        b.alloc("_expr").mkString("primopApp", state.mem);
+        b.alloc("primop").mkString(cur->primOp()->name, state.mem);
+
+        ListBuilder argsList = state.buildList(appliedArgs.size());
+        for (const auto &[i, v] : enumerate(argsList)) {
+            v = appliedArgs[i];
+        }
+        b.alloc("appliedArgs").mkList(argsList);
+
         v.mkAttrs(b);
         return;
     }
