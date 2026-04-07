@@ -3755,6 +3755,7 @@ static RegisterPrimOp primop_map({
     )",
     .fun = prim_map,
 });
+
 static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * env, uint32_t level);
 
 BindingsBuilder reifyParams(EvalState & state, std::optional<Formals> params, Symbol identifier, Env * env, uint32_t level)
@@ -4121,6 +4122,45 @@ static BindingsBuilder appendBindingExpr(EvalState & state, Expr * expr, Env * e
     } else if (ExprFloat * eFloat = dynamic_cast<ExprFloat *>(expr)) {
         b.alloc("_expr").mkString("literal", state.mem);
         b.alloc("value").mkFloat(eFloat->v.fpoint());
+    } else if (ExprOpHasAttr * eHasAttr = dynamic_cast<ExprOpHasAttr *>(expr)) {
+        b.alloc("_expr").mkString("hasAttr", state.mem);
+
+        BindingsBuilder value = state.buildBindings(2);
+
+        BindingsBuilder expression = appendBindingExpr(state, eHasAttr->e, env, level);
+        value.alloc("expression").mkAttrs(expression);
+
+        std::span<const AttrName> path = eHasAttr->attrPath;
+        ListBuilder list = state.buildList(path.size());
+        for (const auto & [i, v] : enumerate(list)) {
+            AttrName aName = path[i];
+            if (aName.expr) {
+                BindingsBuilder e = appendBindingExpr(state, aName.expr, env, level);
+                (v = state.allocValue())->mkAttrs(e);
+            } else {
+                BindingsBuilder pName = state.buildBindings(2);
+                pName.alloc("_expr").mkString("attrName", state.mem);
+                pName.alloc("value").mkString(state.symbols[aName.symbol], state.mem);
+                (v = state.allocValue())->mkAttrs(pName);
+            }
+        }
+        value.alloc("path").mkList(list);
+
+        b.alloc("value").mkAttrs(value);
+    } else if (ExprAssert * eAssert = dynamic_cast<ExprAssert *>(expr)) {
+        b.alloc("_expr").mkString("assert", state.mem);
+
+        BindingsBuilder value = state.buildBindings(2);
+
+        BindingsBuilder cond = appendBindingExpr(state, eAssert->cond, env, level);
+        BindingsBuilder body = appendBindingExpr(state, eAssert->body, env, level);
+
+        value.alloc("condition").mkAttrs(cond);
+        value.alloc("body").mkAttrs(body);
+
+        b.alloc("value").mkAttrs(value);
+    } else if (dynamic_cast<ExprPos *>(expr)) {
+        b.alloc("_expr").mkString("pos", state.mem);
     } else {
         state.error<EvalError>("unsupported Expr for reify").atPos(expr->getPos()).debugThrow();
     }
