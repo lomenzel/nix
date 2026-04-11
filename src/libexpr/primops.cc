@@ -3775,7 +3775,7 @@ BindingsBuilder reifyParams(EvalState & state, std::optional<Formals> params, Sy
             paramAttrSet.alloc("name").mkString(state.symbols[formal.name], state.mem);
 
             if (formal.def) {
-                auto b = appendBindingExpr(state, formal.def, env, level);
+                auto b = appendBindingExpr(state, formal.def, env, level + 1);
                 paramAttrSet.alloc("defaultExpr").mkAttrs(b);
             }
             (v = state.allocValue())->mkAttrs(paramAttrSet);
