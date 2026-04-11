@@ -4264,7 +4264,7 @@ static RegisterPrimOp primop_reify({
         closureEnv = {};
       }`.
     )",
-    .fun = prim_reify,
+    .impl = prim_reify,
 });
 
 static void prim_sameFunction(EvalState & state, const PosIdx pos, Value ** args, Value & v)
@@ -4290,7 +4290,7 @@ static RegisterPrimOp primop_sameFunction({
     .args = {"f1", "f2"},
     .doc = R"(
     )",
-    .fun = prim_sameFunction,
+    .impl = prim_sameFunction,
 });
 
 /* Filter a list using a predicate; that is, return a list containing
