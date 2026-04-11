@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/expr/eval.hh"
+#include "nix/util/os-string.hh"
 
 namespace nix {
 
@@ -27,8 +28,7 @@ struct AbstractNixRepl
      * @param programName Name of the command, e.g. `nix` or `nix-env`.
      * @param args arguments to the command.
      */
-    using RunNix =
-        void(const std::string & programName, const Strings & args, const std::optional<std::string> & input);
+    using RunNix = void(const std::string & programName, OsStrings args, const std::optional<std::string> & input);
 
     /**
      * @param runNix Function to run the nix CLI to support various
@@ -38,7 +38,7 @@ struct AbstractNixRepl
     static std::unique_ptr<AbstractNixRepl> create(
         const LookupPath & lookupPath,
         ref<EvalState> state,
-        std::function<AnnotatedValues()> getValues,
+        fun<AnnotatedValues()> getValues,
         RunNix * runNix = nullptr);
 
     static ReplExitStatus runSimple(ref<EvalState> evalState, const ValMap & extraEnv);

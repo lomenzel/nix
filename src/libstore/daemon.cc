@@ -3,9 +3,9 @@
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/worker-protocol-connection.hh"
 #include "nix/store/worker-protocol-impl.hh"
-#include "nix/store/build-result.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/store-cast.hh"
+#include "nix/store/filetransfer.hh"
 #include "nix/store/gc-store.hh"
 #include "nix/store/log-store.hh"
 #include "nix/store/indirect-root-store.hh"
@@ -15,9 +15,9 @@
 #include "nix/util/archive.hh"
 #include "nix/store/derivations.hh"
 #include "nix/util/args.hh"
-#include "nix/util/git.hh"
 #include "nix/util/logging.hh"
 #include "nix/store/globals.hh"
+#include <variant>
 
 #ifndef _WIN32 // TODO need graceful async exit support on Windows?
 #  include "nix/util/monitor-fd.hh"
@@ -296,16 +296,17 @@ struct ClientSettings
                     trusted || name == settings.getWorkerSettings().buildTimeout.name
                     || name == settings.getWorkerSettings().maxSilentTime.name
                     || name == settings.getWorkerSettings().pollInterval.name || name == "connect-timeout"
-                    || (name == "builders" && value == ""))
+                    || (name == "builders" && value == "")) {
                     settings.set(name, value);
-                else if (setSubstituters(settings.getWorkerSettings().substituters))
+                    fileTransferSettings.set(name, value);
+                } else if (setSubstituters(settings.getWorkerSettings().substituters))
                     ;
                 else
                     warn(
                         "ignoring the client-specified setting '%s', because it is a restricted setting and you are not a trusted user",
                         name);
             } catch (UsageError & e) {
-                warn(e.what());
+                logWarning(e.info());
             }
         }
     }
@@ -508,7 +509,19 @@ static void performOp(
         logger->startWork();
         {
             FramedSource source(conn.from);
-            store->addMultipleToStore(source, RepairFlag{repair}, dontCheckSigs ? NoCheckSigs : CheckSigs);
+            auto expected = readNum<uint64_t>(source);
+            for (uint64_t i = 0; i < expected; ++i) {
+                auto info = WorkerProto::Serialise<ValidPathInfo>::read(
+                    *store,
+                    WorkerProto::ReadConn{
+                        .from = source,
+                        .version = {.number = {.major = 1, .minor = 16}},
+                    });
+                info.ultimate = false;
+                EnsureRead wrapper{source, info.narSize};
+                store->addToStore(info, wrapper, RepairFlag{repair}, dontCheckSigs ? NoCheckSigs : CheckSigs);
+                wrapper.finish();
+            }
         }
         logger->stopWork();
         break;
@@ -680,17 +693,17 @@ static void performOp(
                 "you are not privileged to create perm roots\n\n"
                 "hint: you can just do this client-side without special privileges, and probably want to do that instead.");
         auto storePath = WorkerProto::Serialise<StorePath>::read(*store, rconn);
-        Path gcRoot = absPath(readString(conn.from));
+        std::filesystem::path gcRoot = absPath(readString(conn.from));
         logger->startWork();
         auto & localFSStore = require<LocalFSStore>(*store);
         localFSStore.addPermRoot(storePath, gcRoot);
         logger->stopWork();
-        conn.to << gcRoot;
+        conn.to << gcRoot.string();
         break;
     }
 
     case WorkerProto::Op::AddIndirectRoot: {
-        Path path = absPath(readString(conn.from));
+        std::filesystem::path path = absPath(readString(conn.from));
 
         logger->startWork();
         auto & indirectRootStore = require<IndirectRootStore>(*store);
@@ -733,12 +746,26 @@ static void performOp(
     case WorkerProto::Op::CollectGarbage: {
         GCOptions options;
         options.action = WorkerProto::Serialise<GCOptions::GCAction>::read(*store, rconn);
-        options.pathsToDelete = WorkerProto::Serialise<StorePathSet>::read(*store, rconn);
+        if (rconn.version.features.contains(WorkerProto::featureDeleteDeadSpecific)) {
+            options.pathsToDelete = WorkerProto::Serialise<GCOptions::GCPaths>::read(*store, rconn);
+        } else {
+            auto paths = WorkerProto::Serialise<StorePathSet>::read(*store, rconn);
+            if (options.action != GCAction::gcDeleteSpecific && paths.empty())
+                options.pathsToDelete = GCOptions::WholeStore{};
+            else
+                options.pathsToDelete = paths;
+        }
         conn.from >> options.ignoreLiveness >> options.maxFreed;
         // obsolete fields
         readInt(conn.from);
         readInt(conn.from);
         readInt(conn.from);
+
+        if (options.action == GCAction::gcDeleteDead && std::holds_alternative<StorePathSet>(options.pathsToDelete)
+            && !conn.protoVersion.features.contains(WorkerProto::featureDeleteDeadSpecific)) {
+            throw Error(
+                "Garbage collecting specific paths requested but it is not supported by the negotiated protocol");
+        }
 
         GCResults results;
 
@@ -932,8 +959,9 @@ static void performOp(
 
             logger->startWork();
 
-            // FIXME: race if addToStore doesn't read source?
-            store->addToStore(info, *source, (RepairFlag) repair, dontCheckSigs ? NoCheckSigs : CheckSigs);
+            EnsureRead wrapper{*source, info.narSize};
+            store->addToStore(info, wrapper, (RepairFlag) repair, dontCheckSigs ? NoCheckSigs : CheckSigs);
+            wrapper.finish();
 
             logger->stopWork();
         }
@@ -955,14 +983,8 @@ static void performOp(
 
     case WorkerProto::Op::RegisterDrvOutput: {
         logger->startWork();
-        if (conn.protoVersion.number < WorkerProto::Version::Number{1, 31}) {
-            auto outputId = WorkerProto::Serialise<DrvOutput>::read(*store, rconn);
-            auto outputPath = StorePath(readString(conn.from));
-            store->registerDrvOutput(Realisation{{.outPath = outputPath}, outputId});
-        } else {
-            auto realisation = WorkerProto::Serialise<Realisation>::read(*store, rconn);
-            store->registerDrvOutput(realisation);
-        }
+        auto realisation = WorkerProto::Serialise<Realisation>::read(*store, rconn);
+        store->registerDrvOutput(realisation);
         logger->stopWork();
         break;
     }
@@ -970,19 +992,16 @@ static void performOp(
     case WorkerProto::Op::QueryRealisation: {
         logger->startWork();
         auto outputId = WorkerProto::Serialise<DrvOutput>::read(*store, rconn);
-        auto info = store->queryRealisation(outputId);
+        auto ptr = store->queryRealisation(outputId);
+        std::optional<UnkeyedRealisation> info;
+        if (ptr)
+            info = *ptr;
         logger->stopWork();
-        if (conn.protoVersion.number < WorkerProto::Version::Number{1, 31}) {
-            std::set<StorePath> outPaths;
-            if (info)
-                outPaths.insert(info->outPath);
-            WorkerProto::write(*store, wconn, outPaths);
-        } else {
-            std::set<Realisation> realisations;
-            if (info)
-                realisations.insert({*info, outputId});
-            WorkerProto::write(*store, wconn, realisations);
-        }
+        /* Only return the new format because if we got past
+           `DrvOutput` serialization, we know that is what we're using.
+           */
+        assert(conn.protoVersion.features.contains(WorkerProto::featureRealisationWithPath));
+        WorkerProto::write(*store, wconn, info);
         break;
     }
 

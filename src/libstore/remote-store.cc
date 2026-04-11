@@ -1,3 +1,5 @@
+#include "nix/store/path.hh"
+#include "nix/store/store-api.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
 #include "nix/store/path-with-outputs.hh"
@@ -13,12 +15,12 @@
 #include "nix/store/derivations.hh"
 #include "nix/util/pool.hh"
 #include "nix/util/finally.hh"
-#include "nix/util/git.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/callback.hh"
 #include "nix/store/filetransfer.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/socket.hh"
+#include <variant>
 
 #ifndef _WIN32
 #  include <sys/socket.h>
@@ -458,6 +460,13 @@ void RemoteStore::addToStore(const ValidPathInfo & info, Source & source, Repair
 void RemoteStore::addMultipleToStore(
     PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
 {
+    if (getConnection()->protoVersion < WorkerProto::Version{.number = {1, 32}}) {
+        Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+        return;
+    }
+
+    auto conn(getConnection());
+
     // `addMultipleToStore` is single threaded
     size_t bytesExpected = 0;
     for (auto & [pathInfo, _] : pathsToCopy) {
@@ -486,29 +495,15 @@ void RemoteStore::addMultipleToStore(
         }
     });
 
-    addMultipleToStore(*source, repair, checkSigs);
-}
-
-void RemoteStore::addMultipleToStore(Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
-{
-    if (getConnection()->protoVersion >= WorkerProto::Version{.number = {1, 32}}) {
-        auto conn(getConnection());
-        conn->to << WorkerProto::Op::AddMultipleToStore << repair << !checkSigs;
-        conn.withFramedSink([&](Sink & sink) { source.drainInto(sink); });
-    } else
-        Store::addMultipleToStore(source, repair, checkSigs);
+    conn->to << WorkerProto::Op::AddMultipleToStore << repair << !checkSigs;
+    conn.withFramedSink([&](Sink & sink) { source->drainInto(sink); });
 }
 
 void RemoteStore::registerDrvOutput(const Realisation & info)
 {
     auto conn(getConnection());
     conn->to << WorkerProto::Op::RegisterDrvOutput;
-    if (conn->protoVersion.number < WorkerProto::Version::Number{1, 31}) {
-        WorkerProto::write(*this, *conn, info.id);
-        conn->to << std::string(info.outPath.to_string());
-    } else {
-        WorkerProto::write(*this, *conn, info);
-    }
+    WorkerProto::write(*this, *conn, info);
     conn.processStderr();
 }
 
@@ -518,8 +513,10 @@ void RemoteStore::queryRealisationUncached(
     try {
         auto conn(getConnection());
 
-        if (conn->protoVersion.number < WorkerProto::Version::Number{1, 27}) {
-            warn("the daemon is too old to support content-addressing derivations, please upgrade it to 2.4");
+        if (!conn->protoVersion.features.contains(WorkerProto::featureRealisationWithPath)) {
+            warn(
+                "the daemon is missing the '%s' protocol feature, needed to support content-addressing derivations",
+                WorkerProto::featureRealisationWithPath);
             return callback(nullptr);
         }
 
@@ -527,21 +524,12 @@ void RemoteStore::queryRealisationUncached(
         WorkerProto::write(*this, *conn, id);
         conn.processStderr();
 
-        auto real = [&]() -> std::shared_ptr<const UnkeyedRealisation> {
-            if (conn->protoVersion.number < WorkerProto::Version::Number{1, 31}) {
-                auto outPaths = WorkerProto::Serialise<std::set<StorePath>>::read(*this, *conn);
-                if (outPaths.empty())
-                    return nullptr;
-                return std::make_shared<const UnkeyedRealisation>(UnkeyedRealisation{.outPath = *outPaths.begin()});
-            } else {
-                auto realisations = WorkerProto::Serialise<std::set<Realisation>>::read(*this, *conn);
-                if (realisations.empty())
-                    return nullptr;
-                return std::make_shared<const UnkeyedRealisation>(*realisations.begin());
-            }
-        }();
-
-        callback(std::shared_ptr<const UnkeyedRealisation>(real));
+        callback([&]() -> std::shared_ptr<const UnkeyedRealisation> {
+            auto realisation = WorkerProto::Serialise<std::optional<UnkeyedRealisation>>::read(*this, *conn);
+            if (!realisation)
+                return nullptr;
+            return std::make_shared<const UnkeyedRealisation>(*realisation);
+        }());
     } catch (...) {
         return callback.rethrow();
     }
@@ -623,30 +611,19 @@ std::vector<KeyedBuildResult> RemoteStore::buildPathsWithResults(
 
                         OutputPathMap outputs;
                         auto drvPath = resolveDerivedPath(*evalStore, *bfd.drvPath);
-                        auto drv = evalStore->readDerivation(drvPath);
-                        const auto outputHashes = staticOutputHashes(*evalStore, drv); // FIXME: expensive
                         auto built = resolveDerivedPath(*this, bfd, &*evalStore);
                         for (auto & [output, outputPath] : built) {
-                            auto outputHash = get(outputHashes, output);
-                            if (!outputHash)
-                                throw Error(
-                                    "the derivation '%s' doesn't have an output named '%s'",
-                                    printStorePath(drvPath),
-                                    output);
-                            auto outputId = DrvOutput{*outputHash, output};
+                            auto outputId = DrvOutput{drvPath, output};
                             if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
                                 auto realisation = queryRealisation(outputId);
                                 if (!realisation)
-                                    throw MissingRealisation(outputId);
-                                success.builtOutputs.emplace(output, Realisation{*realisation, outputId});
+                                    throw MissingRealisation(*this, outputId);
+                                success.builtOutputs.emplace(output, *realisation);
                             } else {
                                 success.builtOutputs.emplace(
                                     output,
-                                    Realisation{
-                                        UnkeyedRealisation{
-                                            .outPath = outputPath,
-                                        },
-                                        outputId,
+                                    UnkeyedRealisation{
+                                        .outPath = outputPath,
                                     });
                             }
                         }
@@ -695,7 +672,7 @@ Roots RemoteStore::findRoots(bool censor)
     size_t count = readNum<size_t>(conn->from);
     Roots result;
     while (count--) {
-        Path link = readString(conn->from);
+        std::string link = readString(conn->from);
         result[WorkerProto::Serialise<StorePath>::read(*this, *conn)].emplace(link);
     }
     return result;
@@ -705,9 +682,26 @@ void RemoteStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
     auto conn(getConnection());
 
-    conn->to << WorkerProto::Op::CollectGarbage;
-    WorkerProto::write(*this, *conn, options.action);
-    WorkerProto::write(*this, *conn, options.pathsToDelete);
+    if (conn->protoVersion.features.contains(WorkerProto::featureDeleteDeadSpecific)) {
+        conn->to << WorkerProto::Op::CollectGarbage;
+        WorkerProto::write(*this, *conn, options.action);
+        WorkerProto::write(*this, *conn, options.pathsToDelete);
+    } else {
+        auto paths = std::visit(
+            overloaded{
+                [&](const StorePathSet & paths) {
+                    if (options.action != GCOptions::gcDeleteSpecific)
+                        throw Error(
+                            "Your daemon version is too old to support garbage collecting a specific set of paths");
+                    return paths;
+                },
+                [](const GCOptions::WholeStore & _) { return StorePathSet{}; },
+            },
+            options.pathsToDelete);
+        conn->to << WorkerProto::Op::CollectGarbage;
+        WorkerProto::write(*this, *conn, options.action);
+        WorkerProto::write(*this, *conn, paths);
+    }
     conn->to << options.ignoreLiveness
              << options.maxFreed
              /* removed options */
@@ -715,7 +709,7 @@ void RemoteStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     conn.processStderr();
 
-    results.paths = readStrings<PathSet>(conn->from);
+    results.paths = readStrings<StringSet>(conn->from);
     results.bytesFreed = readLongLong(conn->from);
     readLongLong(conn->from); // obsolete
 
@@ -841,7 +835,7 @@ std::shared_ptr<SourceAccessor> RemoteStore::getFSAccessor(const StorePath & pat
     return getRemoteFSAccessor(requireValidPath)->accessObject(path);
 }
 
-void RemoteStore::ConnectionHandle::withFramedSink(std::function<void(Sink & sink)> fun)
+void RemoteStore::ConnectionHandle::withFramedSink(fun<void(Sink & sink)> sendData)
 {
     (*this)->to.flush();
 
@@ -851,7 +845,7 @@ void RemoteStore::ConnectionHandle::withFramedSink(std::function<void(Sink & sin
                from the daemon. */
             processStderr(nullptr, nullptr, false, false);
         });
-        fun(sink);
+        sendData(sink);
         sink.flush();
     }
 

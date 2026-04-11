@@ -1,5 +1,5 @@
 #include "nix/store/sqlite.hh"
-#include "nix/store/globals.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/util/util.hh"
 #include "nix/util/url.hh"
 #include "nix/util/signals.hh"
@@ -10,14 +10,13 @@
 
 #include <sqlite3.h>
 
-#include <atomic>
 #include <thread>
 
 namespace nix {
 
 SQLiteError::SQLiteError(
     const char * path, const char * errMsg, int errNo, int extendedErrNo, int offset, HintFmt && hf)
-    : Error("")
+    : CloneableError("")
     , path(path)
     , errMsg(errMsg)
     , errNo(errNo)
@@ -278,7 +277,7 @@ SQLiteTxn::~SQLiteTxn()
 
 void handleSQLiteBusy(const SQLiteBusy & e, time_t & nextWarning)
 {
-    time_t now = time(0);
+    time_t now = time(nullptr);
     if (now > nextWarning) {
         nextWarning = now + 10;
         logWarning({.msg = e.info().msg});

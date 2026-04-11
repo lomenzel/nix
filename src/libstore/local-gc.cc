@@ -2,7 +2,6 @@
 #include "nix/store/store-dir-config.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/signals.hh"
-#include "nix/util/types.hh"
 #include "nix/store/local-gc.hh"
 #include <filesystem>
 #include <boost/regex.hpp>
@@ -128,8 +127,8 @@ Roots findRuntimeRootsUnchecked(const StoreDirConfig & config)
     if (getEnv("_NIX_TEST_NO_LSOF") != "1") {
         try {
             boost::regex lsofRegex(R"(^n(/.*)$)");
-            auto lsofLines =
-                tokenizeString<std::vector<std::string>>(runProgram(LSOF, true, {"-n", "-w", "-F", "n"}), "\n");
+            auto lsofLines = tokenizeString<std::vector<std::string>>(
+                runProgram(LSOF, true, {OS_STR("-n"), OS_STR("-w"), OS_STR("-F"), OS_STR("n")}), "\n");
             for (const auto & line : lsofLines) {
                 boost::smatch match;
                 if (boost::regex_match(line, match, lsofRegex))

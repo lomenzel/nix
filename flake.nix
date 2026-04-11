@@ -409,7 +409,9 @@
 
               "nix-cmd" = { };
 
-              "nix-nswrapper" = { };
+              "nix-nswrapper" = {
+                linuxOnly = true;
+              };
 
               "nix-cli" = { };
 
@@ -426,36 +428,45 @@
               "nix-perl-bindings" = {
                 supportsCross = false;
               };
+
+              "nix-clang-tidy-plugin" = {
+                supportsCross = false;
+              };
             }
             (
               pkgName:
               {
                 supportsCross ? true,
+                linuxOnly ? false,
               }:
-              {
-                # These attributes go right into `packages.<system>`.
-                "${pkgName}" = nixpkgsFor.${system}.native.nixComponents2.${pkgName};
-                "${pkgName}-static" = nixpkgsFor.${system}.native.pkgsStatic.nixComponents2.${pkgName};
-                "${pkgName}-llvm" = nixpkgsFor.${system}.native.pkgsLLVM.nixComponents2.${pkgName};
-              }
+              lib.optionalAttrs (linuxOnly -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux) (
+                {
+                  # These attributes go right into `packages.<system>`.
+                  "${pkgName}" = nixpkgsFor.${system}.native.nixComponents2.${pkgName};
+                  "${pkgName}-static" = nixpkgsFor.${system}.native.pkgsStatic.nixComponents2.${pkgName};
+                  "${pkgName}-llvm" = nixpkgsFor.${system}.native.pkgsLLVM.nixComponents2.${pkgName};
+                }
+                // flatMapAttrs (lib.genAttrs stdenvs (_: { })) (
+                  stdenvName:
+                  { }:
+                  {
+                    # These attributes go right into `packages.<system>`.
+                    "${pkgName}-${stdenvName}" =
+                      nixpkgsFor.${system}.nativeForStdenv.${stdenvName}.nixComponents2.${pkgName};
+                  }
+                )
+              )
               // lib.optionalAttrs supportsCross (
                 flatMapAttrs (lib.genAttrs crossSystems (_: { })) (
                   crossSystem:
                   { }:
-                  {
-                    # These attributes go right into `packages.<system>`.
-                    "${pkgName}-${crossSystem}" = nixpkgsFor.${system}.cross.${crossSystem}.nixComponents2.${pkgName};
-                  }
+                  lib.optionalAttrs
+                    (linuxOnly -> nixpkgsFor.${system}.cross.${crossSystem}.stdenv.hostPlatform.isLinux)
+                    {
+                      # These attributes go right into `packages.<system>`.
+                      "${pkgName}-${crossSystem}" = nixpkgsFor.${system}.cross.${crossSystem}.nixComponents2.${pkgName};
+                    }
                 )
-              )
-              // flatMapAttrs (lib.genAttrs stdenvs (_: { })) (
-                stdenvName:
-                { }:
-                {
-                  # These attributes go right into `packages.<system>`.
-                  "${pkgName}-${stdenvName}" =
-                    nixpkgsFor.${system}.nativeForStdenv.${stdenvName}.nixComponents2.${pkgName};
-                }
               )
             )
         // lib.optionalAttrs (builtins.elem system linux64BitSystems) {
@@ -501,6 +512,16 @@
       devShells =
         let
           makeShell = import ./packaging/dev-shell.nix { inherit lib devFlake; };
+          makeShell' =
+            { pkgs }:
+            makeShell {
+              inherit pkgs;
+              nixComponents = pkgs.nixComponents2.overrideScope (
+                finalScope: prevScope: {
+                  withUnityBuild = false;
+                }
+              );
+            };
           prefixAttrs = prefix: lib.concatMapAttrs (k: v: { "${prefix}-${k}" = v; });
         in
         forAllSystems (
@@ -508,7 +529,7 @@
           prefixAttrs "native" (
             forAllStdenvs (
               stdenvName:
-              makeShell {
+              makeShell' {
                 pkgs = nixpkgsFor.${system}.nativeForStdenv.${stdenvName};
               }
             )
@@ -517,7 +538,7 @@
             prefixAttrs "static" (
               forAllStdenvs (
                 stdenvName:
-                makeShell {
+                makeShell' {
                   pkgs = nixpkgsFor.${system}.nativeForStdenv.${stdenvName}.pkgsStatic;
                 }
               )
@@ -525,7 +546,7 @@
             // prefixAttrs "llvm" (
               forAllStdenvs (
                 stdenvName:
-                makeShell {
+                makeShell' {
                   pkgs = nixpkgsFor.${system}.nativeForStdenv.${stdenvName}.pkgsLLVM;
                 }
               )
@@ -533,7 +554,7 @@
             // prefixAttrs "cross" (
               forAllCrossSystems (
                 crossSystem:
-                makeShell {
+                makeShell' {
                   pkgs = nixpkgsFor.${system}.cross.${crossSystem};
                 }
               )

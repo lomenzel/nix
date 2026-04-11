@@ -44,8 +44,8 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto dbPath = (getCacheDir() / "fetcher-cache-v4.sqlite").string();
-        createDirs(dirOf(dbPath));
+        auto dbPath = getCacheDir() / "fetcher-cache-v4.sqlite";
+        createDirs(dbPath.parent_path());
 
         state->db = SQLite(dbPath, {.useWAL = nix::settings.useSQLiteWAL});
         state->db.isCache();
@@ -60,7 +60,7 @@ struct CacheImpl : Cache
     void upsert(const Key & key, const Attrs & value) override
     {
         _state.lock()
-            ->upsert.use()(key.first)(attrsToJSON(key.second).dump())(attrsToJSON(value).dump())(time(0))
+            ->upsert.use()(key.first)(attrsToJSON(key.second).dump())(attrsToJSON(value).dump())(time(nullptr))
             .exec();
     }
 
@@ -99,7 +99,7 @@ struct CacheImpl : Cache
         debug("using cache entry '%s:%s' -> '%s'", key.first, keyJSON, valueJSON);
 
         return Result{
-            .expired = settings.tarballTtl.get() == 0 || timestamp + settings.tarballTtl < time(0),
+            .expired = settings.tarballTtl.get() == 0 || timestamp + settings.tarballTtl < time(nullptr),
             .value = jsonToAttrs(nlohmann::json::parse(valueJSON)),
         };
     }

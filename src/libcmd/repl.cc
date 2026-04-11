@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #include "nix/util/error.hh"
 #include "nix/cmd/repl-interacter.hh"
@@ -16,6 +17,7 @@
 #include "nix/cmd/get-build-log.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/derivations.hh"
+#include "nix/store/outputs-query.hh"
 #include "nix/store/globals.hh"
 #include "nix/flake/flake.hh"
 #include "nix/flake/lockfile.hh"
@@ -28,6 +30,8 @@
 #include "nix/util/ref.hh"
 #include "nix/expr/value.hh"
 
+#include "nix/util/os-string.hh"
+#include "nix/util/processes.hh"
 #include "nix/util/strings.hh"
 
 namespace nix {
@@ -60,7 +64,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
     std::list<std::filesystem::path> loadedFiles;
     // Arguments passed to :load-flake, saved so they can be reloaded with :reload
     Strings loadedFlakes;
-    std::function<AnnotatedValues()> getValues;
+    fun<AnnotatedValues()> getValues;
 
     const static int envSize = 32768;
     std::shared_ptr<StaticEnv> staticEnv;
@@ -71,15 +75,11 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
 
     RunNix * runNixPtr;
 
-    void runNix(const std::string & program, const Strings & args, const std::optional<std::string> & input = {});
+    void runNix(const std::string & program, OsStrings args, const std::optional<std::string> & input = {});
 
     std::unique_ptr<ReplInteracter> interacter;
 
-    NixRepl(
-        const LookupPath & lookupPath,
-        ref<EvalState> state,
-        std::function<AnnotatedValues()> getValues,
-        RunNix * runNix);
+    NixRepl(const LookupPath & lookupPath, ref<EvalState> state, fun<AnnotatedValues()> getValues, RunNix * runNix);
     virtual ~NixRepl() = default;
 
     ReplExitStatus mainLoop() override;
@@ -98,6 +98,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
     void addAttrsToScope(Value & attrs);
     void addVarToScope(const Symbol name, Value & v);
     Expr * parseString(std::string s);
+    ExprAttrs * parseReplBindings(std::string s);
     void evalString(std::string s, Value & v);
     void loadDebugTraceEnv(DebugTrace & dt);
 
@@ -130,16 +131,13 @@ std::string removeWhitespace(std::string s)
 }
 
 NixRepl::NixRepl(
-    const LookupPath & lookupPath,
-    ref<EvalState> state,
-    std::function<NixRepl::AnnotatedValues()> getValues,
-    RunNix * runNix)
+    const LookupPath & lookupPath, ref<EvalState> state, fun<NixRepl::AnnotatedValues()> getValues, RunNix * runNix)
     : AbstractNixRepl(state)
     , debugTraceIndex(0)
     , getValues(getValues)
     , staticEnv(new StaticEnv(nullptr, state->staticBaseEnv))
     , runNixPtr{runNix}
-    , interacter(make_unique<ReadlineLikeInteracter>((getDataDir() / "repl-history").string()))
+    , interacter(std::make_unique<ReadlineLikeInteracter>(getDataDir() / "repl-history"))
 {
 }
 
@@ -304,21 +302,6 @@ StringSet NixRepl::completePrefix(const std::string & prefix)
     }
 
     return completions;
-}
-
-// FIXME: DRY and match or use the parser
-static bool isVarName(std::string_view s)
-{
-    if (s.size() == 0)
-        return false;
-    char c = s[0];
-    if ((c >= '0' && c <= '9') || c == '-' || c == '\'')
-        return false;
-    for (auto & i : s)
-        if (!((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9') || i == '_' || i == '-'
-              || i == '\''))
-            return false;
-    return true;
 }
 
 StorePath NixRepl::getDerivationPath(Value & v)
@@ -508,7 +491,12 @@ ProcessLineResult NixRepl::processLine(std::string line)
 
         // runProgram redirects stdout to a StringSink,
         // using runProgram2 to allow editors to display their UI
-        runProgram2(RunOptions{.program = editor, .lookupPath = true, .args = args, .isInteractive = true});
+        runProgram2({
+            .program = editor,
+            .lookupPath = true,
+            .args = toOsStrings(std::move(args)),
+            .isInteractive = true,
+        });
 
         // Reload right after exiting the editor
         state->resetFileCache();
@@ -528,7 +516,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
         state->callFunction(f, v, result, PosIdx());
 
         StorePath drvPath = getDerivationPath(result);
-        runNix("nix-shell", {state->store->printStorePath(drvPath)});
+        runNix("nix-shell", toOsStrings({state->store->printStorePath(drvPath)}));
     }
 
     else if (command == ":b" || command == ":bl" || command == ":i" || command == ":sh" || command == ":log") {
@@ -548,7 +536,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
             });
             auto drv = state->store->readDerivation(drvPath);
             logger->cout("\nThis derivation produced the following outputs:");
-            for (auto & [outputName, outputPath] : state->store->queryDerivationOutputMap(drvPath)) {
+            for (auto & [outputName, outputPath] : deepQueryDerivationOutputMap(*state->store, drvPath)) {
                 auto localStore = state->store.dynamic_pointer_cast<LocalFSStore>();
                 if (localStore && command == ":bl") {
                     std::string symlink = "repl-result-" + outputName;
@@ -559,7 +547,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
                 }
             }
         } else if (command == ":i") {
-            runNix("nix-env", {"-i", drvPathRaw});
+            runNix("nix-env", toOsStrings({"-i", drvPathRaw}));
         } else if (command == ":log") {
             settings.readOnlyMode = true;
             Finally roModeReset([&]() { settings.readOnlyMode = false; });
@@ -567,7 +555,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
             auto log = fetchBuildLog(state->store, drvPath, drvPathRaw);
             logger->writeToStdout(log);
         } else {
-            runNix("nix-shell", {drvPathRaw});
+            runNix("nix-shell", toOsStrings({drvPathRaw}));
         }
     }
 
@@ -668,15 +656,22 @@ ProcessLineResult NixRepl::processLine(std::string line)
         throw Error("unknown command '%1%'", command);
 
     else {
-        size_t p = line.find('=');
-        std::string name;
-        if (p != std::string::npos && p < line.size() && line[p + 1] != '='
-            && isVarName(name = removeWhitespace(line.substr(0, p)))) {
-            Expr * e = parseString(line.substr(p + 1));
-            Value & v(*state->allocValue());
-            v.mkThunk(env, e);
-            addVarToScope(state->symbols.create(name), v);
+        // Try parsing as bindings first (handles `x = 1`, `inherit ...`, etc.)
+        ExprAttrs * bindings = nullptr;
+        try {
+            bindings = parseReplBindings(line);
+        } catch (ParseError &) {
+        }
+
+        if (bindings) {
+            Env * inheritEnv = bindings->inheritFromExprs ? bindings->buildInheritFromEnv(*state, *env) : nullptr;
+            for (auto & [symbol, def] : *bindings->attrs) {
+                Value & v(*state->allocValue());
+                v.mkThunk(def.chooseByKind(env, env, inheritEnv), def.e);
+                addVarToScope(symbol, v);
+            }
         } else {
+            // Otherwise evaluate as expression
             Value v;
             evalString(line, v);
             auto suspension = logger->suspend();
@@ -865,6 +860,28 @@ Expr * NixRepl::parseString(std::string s)
     }
 }
 
+ExprAttrs * NixRepl::parseReplBindings(std::string s)
+{
+    auto basePath = state->rootPath(".");
+
+    // Try parsing as bindings
+    std::exception_ptr bindingsError;
+    try {
+        return state->parseReplBindings(s, basePath, staticEnv);
+    } catch (ParseError &) {
+        bindingsError = std::current_exception();
+    }
+
+    // Try with semicolon appended (for `inherit foo` shorthand)
+    // Use original source (s) for error messages, not s + ";"
+    try {
+        return state->parseReplBindings(s + ";", s, basePath, staticEnv);
+    } catch (ParseError &) {
+        // Semicolon retry failed; rethrow the original bindings error
+        std::rethrow_exception(bindingsError);
+    }
+}
+
 void NixRepl::evalString(std::string s, Value & v)
 {
     Expr * e = parseString(s);
@@ -872,10 +889,10 @@ void NixRepl::evalString(std::string s, Value & v)
     state->forceValue(v, v.determinePos(noPos));
 }
 
-void NixRepl::runNix(const std::string & program, const Strings & args, const std::optional<std::string> & input)
+void NixRepl::runNix(const std::string & program, OsStrings args, const std::optional<std::string> & input)
 {
     if (runNixPtr)
-        (*runNixPtr)(program, args, input);
+        (*runNixPtr)(program, std::move(args), input);
     else
         throw Error(
             "Cannot run '%s' because no method of calling the Nix CLI was provided. This is a configuration problem pertaining to how this program was built. See Nix 2.25 release notes",
@@ -883,7 +900,7 @@ void NixRepl::runNix(const std::string & program, const Strings & args, const st
 }
 
 std::unique_ptr<AbstractNixRepl> AbstractNixRepl::create(
-    const LookupPath & lookupPath, ref<EvalState> state, std::function<AnnotatedValues()> getValues, RunNix * runNix)
+    const LookupPath & lookupPath, ref<EvalState> state, fun<AnnotatedValues()> getValues, RunNix * runNix)
 {
     return std::make_unique<NixRepl>(lookupPath, state, getValues, runNix);
 }

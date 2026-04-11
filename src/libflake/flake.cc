@@ -17,7 +17,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-#include <format>
 
 #include "nix/util/terminal.hh"
 #include "nix/util/ref.hh"
@@ -57,15 +56,12 @@
 #include "nix/util/logging.hh"
 #include "nix/util/pos-idx.hh"
 #include "nix/util/pos-table.hh"
-#include "nix/util/position.hh"
 #include "nix/util/source-path.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 
 namespace nix {
 struct SourceAccessor;
-
-using namespace flake;
 
 namespace flake {
 
@@ -596,7 +592,7 @@ lockFlake(const Settings & settings, EvalState & state, const FlakeRef & topRef,
                         if (auto relativePath = input.ref->input.isRelative()) {
                             return SourcePath{
                                 overriddenSourcePath.accessor,
-                                CanonPath(*relativePath, overriddenSourcePath.path.parent().value())};
+                                CanonPath(relativePath->string(), overriddenSourcePath.path.parent().value())};
                         } else
                             return std::nullopt;
                     };

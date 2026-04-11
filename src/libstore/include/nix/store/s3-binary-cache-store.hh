@@ -9,9 +9,15 @@ namespace nix {
 
 struct S3BinaryCacheStoreConfig : HttpBinaryCacheStoreConfig
 {
-    using HttpBinaryCacheStoreConfig::HttpBinaryCacheStoreConfig;
+    S3BinaryCacheStoreConfig(const Params & params)
+        : StoreConfig(params, FilePathType::Unix)
+        , HttpBinaryCacheStoreConfig(params)
+    {
+    }
 
-    S3BinaryCacheStoreConfig(std::string_view uriScheme, std::string_view bucketName, const Params & params);
+    S3BinaryCacheStoreConfig(ParsedURL cacheUri, const Params & params);
+
+    S3BinaryCacheStoreConfig(std::string_view bucketName, const Params & params);
 
     Setting<std::string> profile{
         this,

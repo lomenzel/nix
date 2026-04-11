@@ -3,7 +3,6 @@
 #include "nix/main/shared.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/filetransfer.hh"
-#include "nix/util/finally.hh"
 #include "nix/main/loggers.hh"
 #include "nix/util/tarfile.hh"
 #include "nix/expr/attr-path.hh"
@@ -11,7 +10,6 @@
 #include "nix/cmd/legacy.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/cmd/misc-store-flags.hh"
-#include "nix/util/terminal.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/url.hh"
 #include "nix/store/path.hh"
@@ -20,7 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
-using namespace nix;
+namespace nix {
 
 /* If ‘url’ starts with ‘mirror://’, then resolve it using the list of
    mirrors defined in Nixpkgs. */
@@ -112,7 +110,7 @@ std::tuple<StorePath, Hash> prefetchFile(
             if (executable)
                 mode = 0700;
 
-            AutoCloseFD fd = openNewFileForWrite(tmpFile, mode, {.truncateExisting = false});
+            auto fd = openNewFileForWrite(tmpFile, mode, {.truncateExisting = false});
             if (!fd)
                 throw SysError("creating temporary file %s", PathFmt(tmpFile));
 
@@ -131,6 +129,8 @@ std::tuple<StorePath, Hash> prefetchFile(
             unpackTarfile(tmpFile, unpacked);
 
             auto entries = DirectoryIterator{unpacked};
+            if (entries == DirectoryIterator{})
+                throw Error("archive '%s' is empty", url.to_string());
             /* If the archive unpacks to a single file/directory, then use
                that as the top-level. */
             tmpFile = entries->path();
@@ -349,3 +349,5 @@ struct CmdStorePrefetchFile : StoreCommand, MixJSON
 };
 
 static auto rCmdStorePrefetchFile = registerCommand2<CmdStorePrefetchFile>({"store", "prefetch-file"});
+
+} // namespace nix

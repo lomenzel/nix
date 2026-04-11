@@ -5,7 +5,6 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/attr-path.hh"
-#include "nix/util/signals.hh"
 #include "nix/expr/value-to-xml.hh"
 #include "nix/expr/value-to-json.hh"
 #include "nix/store/store-open.hh"
@@ -14,12 +13,11 @@
 #include "nix/cmd/legacy.hh"
 #include "man-pages.hh"
 
-#include <map>
 #include <iostream>
 
-using namespace nix;
+namespace nix {
 
-static Path gcRoot;
+std::filesystem::path gcRoot;
 static int rootNr = 0;
 
 enum OutputKind { okPlain, okRaw, okXML, okJSON };
@@ -83,15 +81,15 @@ void processExpr(
                 if (outputName == "")
                     throw Error("derivation '%1%' lacks an 'outputName' attribute", drvPathS);
 
-                if (gcRoot == "")
+                if (gcRoot.empty())
                     printGCWarning();
                 else {
-                    Path rootName = absPath(gcRoot);
+                    auto rootName = absPath(gcRoot);
                     if (++rootNr > 1)
                         rootName += "-" + std::to_string(rootNr);
                     auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
                     if (store2)
-                        drvPathS = store2->addPermRoot(drvPath, rootName);
+                        drvPathS = store2->addPermRoot(drvPath, rootName).string();
                 }
                 std::cout << fmt("%s%s\n", drvPathS, (outputName != "out" ? "!" + outputName : ""));
             }
@@ -209,3 +207,5 @@ static int main_nix_instantiate(int argc, char ** argv)
 }
 
 static RegisterLegacyCommand r_nix_instantiate("nix-instantiate", main_nix_instantiate);
+
+} // namespace nix

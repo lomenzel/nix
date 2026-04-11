@@ -2,9 +2,8 @@
 #include "nix/util/error.hh"
 #include <cmath>
 
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 namespace nix {
 
@@ -16,8 +15,7 @@ std::chrono::microseconds getCpuUserTime()
     FILETIME userTime;
 
     if (!GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime, &kernelTime, &userTime)) {
-        auto lastError = GetLastError();
-        throw windows::WinError(lastError, "failed to get CPU time");
+        throw windows::WinError("failed to get CPU time");
     }
 
     ULARGE_INTEGER uLargeInt;
@@ -32,4 +30,3 @@ std::chrono::microseconds getCpuUserTime()
 }
 
 } // namespace nix
-#endif // ifdef _WIN32

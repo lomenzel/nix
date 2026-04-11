@@ -3,11 +3,10 @@
 #include "nix/util/compression.hh"
 #include "nix/store/derivations.hh"
 #include "nix/util/source-accessor.hh"
-#include "nix/store/globals.hh"
+#include "nix/store/nar-info-disk-cache.hh"
 #include "nix/store/nar-info.hh"
 #include "nix/util/sync.hh"
 #include "nix/store/remote-fs-accessor.hh"
-#include "nix/store/nar-info-disk-cache.hh"
 #include "nix/util/nar-accessor.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/util/callback.hh"
@@ -17,7 +16,6 @@
 #include <chrono>
 #include <future>
 #include <regex>
-#include <fstream>
 #include <sstream>
 
 #include <nlohmann/json.hpp>
@@ -27,12 +25,12 @@ namespace nix {
 BinaryCacheStore::BinaryCacheStore(Config & config)
     : config{config}
 {
-    if (config.secretKeyFile != "")
-        signers.push_back(std::make_unique<LocalSigner>(SecretKey{readFile(config.secretKeyFile)}));
+    if (auto & skf = config.secretKeyFile.get())
+        signers.push_back(std::make_unique<LocalSigner>(SecretKey{readFile(*skf)}));
 
     if (config.secretKeyFiles != "") {
         std::stringstream ss(config.secretKeyFiles);
-        Path keyPath;
+        std::string keyPath;
         while (std::getline(ss, keyPath, ',')) {
             signers.push_back(std::make_unique<LocalSigner>(SecretKey{readFile(keyPath)}));
         }
@@ -137,7 +135,7 @@ void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
 }
 
 ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
-    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, std::function<ValidPathInfo(HashResult)> mkInfo)
+    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo)
 {
     auto fdTemp = createAnonymousTempFile();
 
@@ -514,7 +512,7 @@ StorePath BinaryCacheStore::addToStore(
 
 std::string BinaryCacheStore::makeRealisationPath(const DrvOutput & id)
 {
-    return realisationsPrefix + "/" + id.to_string() + ".doi";
+    return realisationsPrefix + "/" + id.drvPath.to_string() + "/" + id.outputName + ".doi";
 }
 
 void BinaryCacheStore::queryRealisationUncached(
@@ -535,7 +533,10 @@ void BinaryCacheStore::queryRealisationUncached(
                 realisation = std::make_shared<const UnkeyedRealisation>(nlohmann::json::parse(*data));
             } catch (Error & e) {
                 e.addTrace(
-                    {}, "while parsing file '%s' as a realisation for key '%s'", outputInfoFilePath, id.to_string());
+                    {},
+                    "while parsing file '%s' as a build trace value for key '%s'",
+                    outputInfoFilePath,
+                    id.to_string());
                 throw;
             }
             return (*callbackPtr)(std::move(realisation));
@@ -551,7 +552,10 @@ void BinaryCacheStore::registerDrvOutput(const Realisation & info)
 {
     if (diskCache)
         diskCache->upsertRealisation(config.getReference().render(/*FIXME withParams=*/false), info);
-    upsertFile(makeRealisationPath(info.id), static_cast<nlohmann::json>(info).dump(), "application/json");
+    upsertFile(
+        makeRealisationPath(info.id),
+        static_cast<nlohmann::json>(static_cast<const UnkeyedRealisation &>(info)).dump(),
+        "application/json");
 }
 
 ref<RemoteFSAccessor> BinaryCacheStore::getRemoteFSAccessor(bool requireValidPath)

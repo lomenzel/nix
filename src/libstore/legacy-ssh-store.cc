@@ -18,9 +18,9 @@
 
 namespace nix {
 
-LegacySSHStoreConfig::LegacySSHStoreConfig(std::string_view scheme, std::string_view authority, const Params & params)
-    : StoreConfig(params)
-    , CommonSSHStoreConfig(scheme, ParsedURL::Authority::parse(authority), params)
+LegacySSHStoreConfig::LegacySSHStoreConfig(const ParsedURL::Authority & authority, const Params & params)
+    : StoreConfig(params, FilePathType::Unix)
+    , CommonSSHStoreConfig(authority, params)
 {
 }
 
@@ -62,7 +62,7 @@ ref<LegacySSHStore::Connection> LegacySSHStore::openConnection()
         command.push_back("--store");
         command.push_back(config->remoteStore.get());
     }
-    conn->sshConn = master.startCommand(std::move(command), std::list{config->extraSshArgs});
+    conn->sshConn = master.startCommand(toOsStrings(std::move(command)), toOsStrings(std::list{config->extraSshArgs}));
     if (config->connPipeSize) {
         conn->sshConn->trySetBufferSize(*config->connPipeSize);
     }
@@ -174,10 +174,10 @@ void LegacySSHStore::narFromPath(const StorePath & path, Sink & sink)
     narFromPath(path, [&](auto & source) { copyNAR(source, sink); });
 }
 
-void LegacySSHStore::narFromPath(const StorePath & path, std::function<void(Source &)> fun)
+void LegacySSHStore::narFromPath(const StorePath & path, fun<void(Source &)> receiveNar)
 {
     auto conn(connections->get());
-    conn->narFromPath(*this, path, fun);
+    conn->narFromPath(*this, path, receiveNar);
 }
 
 static ServeProto::BuildOptions buildSettings()
@@ -201,7 +201,7 @@ BuildResult LegacySSHStore::buildDerivation(const StorePath & drvPath, const Bas
     return conn->getBuildDerivationResponse(*this);
 }
 
-std::function<BuildResult()> LegacySSHStore::buildDerivationAsync(
+fun<BuildResult()> LegacySSHStore::buildDerivationAsync(
     const StorePath & drvPath, const BasicDerivation & drv, const ServeProto::BuildOptions & options)
 {
     // Until we have C++23 std::move_only_function

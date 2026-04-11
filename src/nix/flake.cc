@@ -5,6 +5,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/derivations.hh"
@@ -29,13 +30,7 @@
 // FIXME is this supposed to be private or not?
 #include "flake-command.hh"
 
-namespace nix::fs {
-using namespace std::filesystem;
-}
-
-using namespace nix;
-using namespace nix::flake;
-using json = nlohmann::json;
+namespace nix {
 
 struct CmdFlakeUpdate;
 
@@ -55,7 +50,7 @@ FlakeRef FlakeCommand::getFlakeRef()
     return parseFlakeRef(fetchSettings, flakeUrl, std::filesystem::current_path().string()); // FIXME
 }
 
-LockedFlake FlakeCommand::lockFlake()
+flake::LockedFlake FlakeCommand::lockFlake()
 {
     return flake::lockFlake(flakeSettings, *getEvalState(), getFlakeRef(), lockFlags);
 }
@@ -92,7 +87,7 @@ public:
             .optional = true,
             .handler = {[&](std::vector<std::string> inputsToUpdate) {
                 for (const auto & inputToUpdate : inputsToUpdate) {
-                    std::optional<NonEmptyInputAttrPath> inputAttrPath;
+                    std::optional<flake::NonEmptyInputAttrPath> inputAttrPath;
                     try {
                         inputAttrPath = flake::NonEmptyInputAttrPath::parse(inputToUpdate);
                         if (!inputAttrPath)
@@ -272,9 +267,9 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
             if (!lockedFlake.lockFile.root->inputs.empty())
                 logger->cout(ANSI_BOLD "Inputs:" ANSI_NORMAL);
 
-            std::set<ref<Node>> visited{lockedFlake.lockFile.root};
+            std::set<ref<flake::Node>> visited{lockedFlake.lockFile.root};
 
-            [&](this const auto & recurse, const Node & node, const std::string & prefix) -> void {
+            [&](this const auto & recurse, const flake::Node & node, const std::string & prefix) -> void {
                 for (const auto & [i, input] : enumerate(node.inputs)) {
                     bool last = i + 1 == node.inputs.size();
 
@@ -298,7 +293,7 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
                             "%s" ANSI_BOLD "%s" ANSI_NORMAL " follows input '%s'",
                             prefix + (last ? treeLast : treeConn),
                             input.first,
-                            printInputAttrPath(*follows));
+                            flake::printInputAttrPath(*follows));
                     }
                 }
             }(*lockedFlake.lockFile.root, "");
@@ -857,9 +852,9 @@ static Strings defaultTemplateAttrPaths = {"templates.default", "defaultTemplate
 struct CmdFlakeInitCommon : virtual Args, EvalCommand
 {
     std::string templateUrl = "templates";
-    Path destDir;
+    std::filesystem::path destDir;
 
-    const LockFlags lockFlags{.writeLockFile = false};
+    const flake::LockFlags lockFlags{.writeLockFile = false};
 
     CmdFlakeInitCommon()
     {
@@ -923,11 +918,11 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
                 else if (st.type == SourceAccessor::tRegular) {
                     auto contents = from2.readFile();
                     if (std::filesystem::exists(to_st)) {
-                        auto contents2 = readFile(to2.string());
+                        auto contents2 = readFile(to2);
                         if (contents != contents2) {
                             printError(
-                                "refusing to overwrite existing file '%s'\n please merge it manually with '%s'",
-                                to2.string(),
+                                "refusing to overwrite existing file %s\n please merge it manually with '%s'",
+                                PathFmt(to2),
                                 from2);
                             conflictedFiles.push_back(to2);
                         } else {
@@ -941,8 +936,8 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
                     if (std::filesystem::exists(to_st)) {
                         if (std::filesystem::read_symlink(to2) != target) {
                             printError(
-                                "refusing to overwrite existing file '%s'\n please merge it manually with '%s'",
-                                to2.string(),
+                                "refusing to overwrite existing file %s\n please merge it manually with '%s'",
+                                PathFmt(to2),
                                 from2);
                             conflictedFiles.push_back(to2);
                         } else {
@@ -950,7 +945,7 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
                         }
                         continue;
                     } else
-                        createSymlink(target, os_string_to_string(PathViewNG{to2}));
+                        createSymlink(target, to2);
                 } else
                     throw Error(
                         "path '%s' needs to be a symlink, file, or directory but instead is a %s",
@@ -962,9 +957,16 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
         }(templateDir, flakeDir);
 
         if (!changedFiles.empty() && std::filesystem::exists(std::filesystem::path{flakeDir} / ".git")) {
-            Strings args = {"-C", flakeDir, "add", "--intent-to-add", "--force", "--"};
+            OsStrings args = {
+                OS_STR("-C"),
+                flakeDir.native(),
+                OS_STR("add"),
+                OS_STR("--intent-to-add"),
+                OS_STR("--force"),
+                OS_STR("--"),
+            };
             for (auto & s : changedFiles)
-                args.emplace_back(s.string());
+                args.emplace_back(s.native());
             runProgram("git", true, args);
         }
 
@@ -1093,9 +1095,9 @@ struct CmdFlakeArchive : FlakeCommand, MixJSON, MixDryRun, MixNoCheckSigs
         sources.insert(storePath);
 
         // FIXME: use graph output, handle cycles.
-        std::function<nlohmann::json(const Node & node)> traverse;
-        traverse = [&](const Node & node) {
-            nlohmann::json jsonObj2 = json ? json::object() : nlohmann::json(nullptr);
+        std::function<nlohmann::json(const flake::Node & node)> traverse;
+        traverse = [&](const flake::Node & node) {
+            nlohmann::json jsonObj2 = json ? nlohmann::json::object() : nlohmann::json(nullptr);
             for (auto & [inputName, input] : node.inputs) {
                 if (auto inputNode = std::get_if<0>(&input)) {
                     std::optional<StorePath> storePath;
@@ -1170,7 +1172,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
         evalSettings.enableImportFromDerivation.setDefault(false);
 
         auto state = getEvalState();
-        auto flake = make_ref<LockedFlake>(lockFlake());
+        auto flake = make_ref<flake::LockedFlake>(lockFlake());
         auto localSystem = std::string(settings.thisSystem.get());
 
         std::function<bool(eval_cache::AttrCursor & visitor, const AttrPath & attrPath, const Symbol & attr)>
@@ -1563,3 +1565,5 @@ static auto rCmdFlakeNew = registerCommand2<CmdFlakeNew>({"flake", "new"});
 static auto rCmdFlakePrefetch = registerCommand2<CmdFlakePrefetch>({"flake", "prefetch"});
 static auto rCmdFlakeShow = registerCommand2<CmdFlakeShow>({"flake", "show"});
 static auto rCmdFlakeUpdate = registerCommand2<CmdFlakeUpdate>({"flake", "update"});
+
+} // namespace nix

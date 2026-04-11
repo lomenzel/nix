@@ -1,10 +1,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
 #include <set>
 #include <memory>
 #include <tuple>
-#include <iomanip>
+
 #ifdef __APPLE__
 #  include <sys/time.h>
 #endif
@@ -24,8 +25,7 @@
 #include "nix/util/experimental-features.hh"
 #include "nix/store/globals.hh"
 
-using namespace nix;
-using std::cin;
+namespace nix {
 
 static void handleAlarm(int sig) {}
 
@@ -35,11 +35,11 @@ std::string escapeUri(std::string uri)
     return uri;
 }
 
-static std::string currentLoad;
+static std::filesystem::path currentLoad;
 
 static AutoCloseFD openSlotLock(const Machine & m, uint64_t slot)
 {
-    return openLockFile(fmt("%s/%s-%d", currentLoad, escapeUri(m.storeUri.render()), slot), true);
+    return openLockFile(currentLoad / fmt("%s-%d", escapeUri(m.storeUri.render()), slot), true);
 }
 
 static bool allSupportedLocally(Store & store, const StringSet & requiredFeatures)
@@ -53,6 +53,23 @@ static bool allSupportedLocally(Store & store, const StringSet & requiredFeature
 static int main_build_remote(int argc, char ** argv)
 {
     {
+        /* Upon exiting, Nix will attempt to terminate this process with
+           SIGTERM. initNix will block or handle SIGTERM, so we need to unblock
+           and unhandle it here.
+        */
+        struct sigaction act;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = 0;
+        act.sa_handler = SIG_DFL;
+        if (sigaction(SIGTERM, &act, 0))
+            throw SysError("resetting SIGTERM");
+
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGTERM);
+        if (pthread_sigmask(SIG_UNBLOCK, &set, nullptr))
+            throw SysError("unblocking SIGTERM");
+
         logger = makeJSONLogger(getStandardError());
 
         /* Ensure we don't get any SSH passphrase or host key popups. */
@@ -85,11 +102,10 @@ static int main_build_remote(int argc, char ** argv)
 
         /* It would be more appropriate to use $XDG_RUNTIME_DIR, since
            that gets cleared on reboot, but it wouldn't work on macOS. */
-        auto currentLoadName = "/current-load";
         if (auto localStore = store.dynamic_pointer_cast<LocalFSStore>())
-            currentLoad = std::string{localStore->config.stateDir} + currentLoadName;
+            currentLoad = localStore->config.stateDir.get() / "current-load";
         else
-            currentLoad = settings.nixStateDir + currentLoadName;
+            currentLoad = std::filesystem::path{settings.nixStateDir} / "current-load";
 
         std::shared_ptr<Store> sshStore;
         AutoCloseFD bestSlotLock;
@@ -134,7 +150,7 @@ static int main_build_remote(int argc, char ** argv)
 
             while (true) {
                 bestSlotLock = -1;
-                AutoCloseFD lock = openLockFile(currentLoad + "/main-lock", true);
+                AutoCloseFD lock = openLockFile(currentLoad / "main-lock", true);
                 lockFile(lock.get(), ltWrite, true);
 
                 bool rightType = false;
@@ -254,13 +270,13 @@ static int main_build_remote(int argc, char ** argv)
 
         std::cerr << "# accept\n" << storeUri << "\n";
 
-        auto inputs = readStrings<PathSet>(source);
+        auto inputs = readStrings<StringSet>(source);
         auto wantedOutputs = readStrings<StringSet>(source);
 
         AutoCloseFD uploadLock;
         {
             auto setUpdateLock = [&](auto && fileName) {
-                uploadLock = openLockFile(currentLoad + "/" + escapeUri(fileName) + ".upload-lock", true);
+                uploadLock = openLockFile(currentLoad / (escapeUri(fileName) + ".upload-lock"), true);
             };
             try {
                 setUpdateLock(storeUri);
@@ -346,13 +362,11 @@ static int main_build_remote(int argc, char ** argv)
             optResult = std::move(res[0]);
         }
 
-        auto outputHashes = staticOutputHashes(*store, drv);
         std::set<Realisation> missingRealisations;
         StorePathSet missingPaths;
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !drv.type().hasKnownOutputPaths()) {
             for (auto & outputName : wantedOutputs) {
-                auto thisOutputHash = outputHashes.at(outputName);
-                auto thisOutputId = DrvOutput{thisOutputHash, outputName};
+                auto thisOutputId = DrvOutput{*drvPath, outputName};
                 if (!store->queryRealisation(thisOutputId)) {
                     debug("missing output %s", outputName);
                     assert(optResult);
@@ -362,7 +376,7 @@ static int main_build_remote(int argc, char ** argv)
                         auto i = success.builtOutputs.find(outputName);
                         assert(i != success.builtOutputs.end());
                         auto & newRealisation = i->second;
-                        missingRealisations.insert(newRealisation);
+                        missingRealisations.insert({newRealisation, thisOutputId});
                         missingPaths.insert(newRealisation.outPath);
                     }
                 }
@@ -396,3 +410,5 @@ static int main_build_remote(int argc, char ** argv)
 }
 
 static RegisterLegacyCommand r_build_remote("build-remote", main_build_remote);
+
+} // namespace nix

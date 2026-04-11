@@ -4,7 +4,7 @@
 #include "nix/main/common-args.hh"
 #include <nlohmann/json.hpp>
 
-using namespace nix;
+namespace nix {
 
 struct MixLs : virtual Args, MixJSON
 {
@@ -120,7 +120,7 @@ struct CmdLsStore : StoreCommand, MixLs
     void run(ref<Store> store) override
     {
         auto [storePath, rest] = store->toStorePath(path);
-        list(store->requireStoreObjectAccessor(storePath), CanonPath{rest});
+        list(store->requireStoreObjectAccessor(storePath), rest);
     }
 };
 
@@ -150,7 +150,7 @@ struct CmdLsNar : Command, MixLs
 
     void run() override
     {
-        AutoCloseFD fd = openFileReadonly(narPath);
+        auto fd = openFileReadonly(narPath);
         if (!fd)
             throw NativeSysError("opening NAR file %s", PathFmt(narPath));
         auto source = FdSource{fd.get()};
@@ -160,3 +160,5 @@ struct CmdLsNar : Command, MixLs
 
 static auto rCmdLsStore = registerCommand2<CmdLsStore>({"store", "ls"});
 static auto rCmdLsNar = registerCommand2<CmdLsNar>({"nar", "ls"});
+
+} // namespace nix

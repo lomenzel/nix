@@ -4,6 +4,7 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/base-n.hh"
 #include "nix/util/finally.hh"
+#include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/users.hh"
@@ -41,9 +42,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <iostream>
-#include <queue>
 #include <regex>
-#include <span>
 #include <ranges>
 
 namespace std {
@@ -74,11 +73,11 @@ namespace nix {
 
 struct GitSourceAccessor;
 
-struct GitError : public Error
+struct GitError final : public CloneableError<GitError, Error>
 {
     template<typename... Ts>
     GitError(const git_error & error, Ts &&... args)
-        : Error("")
+        : CloneableError("")
     {
         auto hf = HintFmt(std::forward<Ts>(args)...);
         err.msg = HintFmt("%1%: %2% (libgit2 error code = %3%)", Uncolored(hf.str()), error.message, error.klass);
@@ -637,12 +636,24 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         //       then use code that was removed in this commit (see blame)
 
         auto dir = this->path;
-        Strings gitArgs{"-C", dir.string(), "--git-dir", ".", "fetch", "--progress", "--force"};
-        if (shallow)
-            append(gitArgs, {"--depth", "1"});
-        append(gitArgs, {std::string("--"), url, refspec});
+        OsStrings gitArgs = {
+            OS_STR("-C"),
+            dir.native(),
+            OS_STR("--git-dir"),
+            OS_STR("."),
+            OS_STR("fetch"),
+            OS_STR("--progress"),
+            OS_STR("--force"),
+        };
+        if (shallow) {
+            gitArgs.push_back(OS_STR("--depth"));
+            gitArgs.push_back(OS_STR("1"));
+        }
+        gitArgs.push_back(OS_STR("--"));
+        gitArgs.push_back(string_to_os_string(url));
+        gitArgs.push_back(string_to_os_string(refspec));
 
-        auto status = runProgram(RunOptions{.program = "git", .args = gitArgs, .isInteractive = true}).first;
+        auto status = runProgram({.program = "git", .args = gitArgs, .isInteractive = true}).first;
 
         if (status > 0)
             throw Error("Failed to fetch git repository '%s'", url);
@@ -682,18 +693,18 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         writeFile(allowedSignersFile, allowedSigners);
 
         // Run verification command
-        auto [status, output] = runProgram(
-            RunOptions{
-                .program = "git",
-                .args =
-                    {"-c",
-                     "gpg.ssh.allowedSignersFile=" + allowedSignersFile,
-                     "-C",
-                     path.string(),
-                     "verify-commit",
-                     rev.gitRev()},
-                .mergeStderrToStdout = true,
-            });
+        auto [status, output] = runProgram({
+            .program = "git",
+            .args{
+                OS_STR("-c"),
+                OS_STR("gpg.ssh.allowedSignersFile=") + allowedSignersFile.native(),
+                OS_STR("-C"),
+                path.native(),
+                OS_STR("verify-commit"),
+                string_to_os_string(rev.gitRev()),
+            },
+            .mergeStderrToStdout = true,
+        });
 
         /* Evaluate result through status code and checking if public
            key fingerprints appear on stderr. This is necessary
@@ -819,7 +830,7 @@ struct GitSourceAccessor : SourceAccessor
         source.drainInto(sink);
     }
 
-    void readFile(const CanonPath & path, Sink & sink, std::function<void(uint64_t)> sizeCallback) override
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
         return readBlob(path, false, sink, sizeCallback);
     }
@@ -1201,7 +1212,7 @@ struct GitFileSystemObjectSinkImpl : GitFileSystemObjectSink
             cur->children.insert_or_assign(name, std::move(child));
     }
 
-    void createRegularFile(const CanonPath & path, std::function<void(CreateRegularFileSink &)> func) override
+    void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func) override
     {
         checkInterrupt();
 
@@ -1422,9 +1433,9 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
     auto self = ref<GitRepoImpl>(shared_from_this());
     ref<SourceAccessor> fileAccessor = AllowListSourceAccessor::create(
                                            makeFSSourceAccessor(path),
-                                           std::set<CanonPath>{wd.files},
+                                           /*allowedPrefixes=*/wd.files,
                                            // Always allow access to the root, but not its children.
-                                           boost::unordered_flat_set<CanonPath>{CanonPath::root},
+                                           /*allowedPaths=*/{CanonPath::root},
                                            std::move(makeNotAllowedError))
                                            .cast<SourceAccessor>();
     if (options.exportIgnore)

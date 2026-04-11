@@ -3,10 +3,11 @@
 #include "nix/store/path-references.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/main/shared.hh"
+#include "nix/util/fun.hh"
 
 #include <queue>
 
-using namespace nix;
+namespace nix {
 
 static std::string hilite(const std::string & s, size_t pos, size_t len, const std::string & colour = ANSI_RED)
 {
@@ -165,12 +166,12 @@ struct CmdWhyDepends : SourceExprCommand, MixOperateOnOptions
            closure (i.e., that have a non-infinite distance to
            'dependency'). Print every edge on a path between `package`
            and `dependency`. */
-        std::function<void(Node &, const std::string &, const std::string &)> printNode;
-
         struct BailOut
         {};
 
-        printNode = [&](Node & node, const std::string & firstPad, const std::string & tailPad) {
+        fun<void(Node &, const std::string &, const std::string &)> printNode = [&](Node & node,
+                                                                                    const std::string & firstPad,
+                                                                                    const std::string & tailPad) {
             assert(node.dist != inf);
             if (precise) {
                 logger->cout(
@@ -294,3 +295,5 @@ struct CmdWhyDepends : SourceExprCommand, MixOperateOnOptions
 };
 
 static auto rCmdWhyDepends = registerCommand<CmdWhyDepends>("why-depends");
+
+} // namespace nix

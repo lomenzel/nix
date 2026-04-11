@@ -23,17 +23,19 @@
 
 namespace nix {
 
-Descriptor openDirectory(const std::filesystem::path & path)
+AutoCloseFD openDirectory(const std::filesystem::path & path, FinalSymlink finalSymlink)
 {
-    return open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    return AutoCloseFD{open(
+        path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | (finalSymlink == FinalSymlink::Follow ? 0 : O_NOFOLLOW))};
 }
 
-Descriptor openFileReadonly(const std::filesystem::path & path)
+AutoCloseFD openFileReadonly(const std::filesystem::path & path, FinalSymlink finalSymlink)
 {
-    return open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    return AutoCloseFD{
+        open(path.c_str(), O_RDONLY | O_CLOEXEC | (finalSymlink == FinalSymlink::Follow ? 0 : O_NOFOLLOW))};
 }
 
-Descriptor openNewFileForWrite(const std::filesystem::path & path, mode_t mode, OpenNewFileForWriteParams params)
+AutoCloseFD openNewFileForWrite(const std::filesystem::path & path, mode_t mode, OpenNewFileForWriteParams params)
 {
     auto flags = O_WRONLY | O_CREAT | O_CLOEXEC;
     if (params.truncateExisting) {
@@ -43,7 +45,7 @@ Descriptor openNewFileForWrite(const std::filesystem::path & path, mode_t mode, 
     } else {
         flags |= O_EXCL; /* O_CREAT | O_EXCL already ensures that symlinks are not followed. */
     }
-    return open(path.c_str(), flags, mode);
+    return AutoCloseFD{open(path.c_str(), flags, mode)};
 }
 
 std::filesystem::path descriptorToPath(Descriptor fd)
@@ -73,7 +75,26 @@ std::filesystem::path descriptorToPath(Descriptor fd)
 
 std::filesystem::path defaultTempDir()
 {
-    return getEnvNonEmpty("TMPDIR").value_or("/tmp");
+    return getEnvOsNonEmpty("TMPDIR").value_or("/tmp");
+}
+
+PosixStat lstat(const std::filesystem::path & path)
+{
+    PosixStat st;
+    if (::lstat(path.c_str(), &st))
+        throw SysError("getting status of %s", PathFmt(path));
+    return st;
+}
+
+std::optional<PosixStat> maybeLstat(const std::filesystem::path & path)
+{
+    std::optional<PosixStat> st{std::in_place};
+    if (::lstat(path.c_str(), &*st)) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return std::nullopt;
+        throw SysError("getting status of %s", PathFmt(path));
+    }
+    return st;
 }
 
 void setWriteTime(
@@ -124,7 +145,7 @@ void setWriteTime(
 }
 
 #ifdef __FreeBSD__
-#  define MOUNTEDPATHS_PARAM , std::set<Path> & mountedPaths
+#  define MOUNTEDPATHS_PARAM , std::set<std::filesystem::path> & mountedPaths
 #  define MOUNTEDPATHS_ARG , mountedPaths
 #else
 #  define MOUNTEDPATHS_PARAM
@@ -146,15 +167,12 @@ static void _deletePath(
     }
 #endif
 
-    std::string name(path.filename());
-    assert(name != "." && name != ".." && !name.empty());
+    auto name = CanonPath::fromFilename(path.filename().native());
 
-    PosixStat st;
-    if (fstatat(parentfd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == -1) {
-        if (errno == ENOENT)
-            return;
-        throw SysError("getting status of %1%", PathFmt(path));
-    }
+    auto st_ = maybeFstatat(parentfd, name.rel());
+    if (!st_)
+        return;
+    auto & st = *st_;
 
     if (!S_ISDIR(st.st_mode)) {
         /* We are about to delete a file. Will it likely free space? */
@@ -185,7 +203,7 @@ static void _deletePath(
         const auto PERM_MASK = S_IRUSR | S_IWUSR | S_IXUSR;
         if ((st.st_mode & PERM_MASK) != PERM_MASK)
             try {
-                unix::fchmodatTryNoFollow(parentfd, CanonPath(name), st.st_mode | PERM_MASK);
+                unix::fchmodatTryNoFollow(parentfd, name, st.st_mode | PERM_MASK);
             } catch (SysError & e) {
                 e.addTrace({}, "while making directory %1% accessible for deletion", PathFmt(path));
                 if (e.errNo == EOPNOTSUPP)
@@ -193,7 +211,7 @@ static void _deletePath(
                 throw;
             }
 
-        int fd = openat(parentfd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        int fd = openat(parentfd, name.rel_c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         if (fd == -1)
             throw SysError("opening directory %1%", PathFmt(path));
         AutoCloseDir dir(fdopendir(fd));
@@ -213,7 +231,7 @@ static void _deletePath(
     }
 
     int flags = S_ISDIR(st.st_mode) ? AT_REMOVEDIR : 0;
-    if (unlinkat(parentfd, name.c_str(), flags) == -1) {
+    if (unlinkat(parentfd, name.rel_c_str(), flags) == -1) {
         if (errno == ENOENT)
             return;
         try {
@@ -230,13 +248,14 @@ static void _deletePath(
 static void _deletePath(const std::filesystem::path & path, uint64_t & bytesFreed MOUNTEDPATHS_PARAM)
 {
     assert(path.is_absolute());
-    assert(path.parent_path() != path);
+    auto parentDirPath = path.parent_path();
+    assert(parentDirPath != path);
 
-    AutoCloseFD dirfd = toDescriptor(open(path.parent_path().string().c_str(), O_RDONLY));
+    AutoCloseFD dirfd = openDirectory(parentDirPath);
     if (!dirfd) {
         if (errno == ENOENT)
             return;
-        throw SysError("opening directory %s", PathFmt(path.parent_path()));
+        throw SysError("opening directory %s", PathFmt(parentDirPath));
     }
 
     std::exception_ptr ex;
@@ -257,7 +276,7 @@ void deletePath(const std::filesystem::path & path, uint64_t & bytesFreed)
 {
     // Activity act(*logger, lvlDebug, "recursively deleting path '%1%'", path);
 #ifdef __FreeBSD__
-    std::set<Path> mountedPaths;
+    std::set<std::filesystem::path> mountedPaths;
     struct statfs * mntbuf;
     int count;
     if ((count = getmntinfo(&mntbuf, MNT_WAIT)) < 0) {
@@ -270,6 +289,12 @@ void deletePath(const std::filesystem::path & path, uint64_t & bytesFreed)
 #endif
     bytesFreed = 0;
     _deletePath(path, bytesFreed MOUNTEDPATHS_ARG);
+}
+
+void chown(const std::filesystem::path & path, uid_t owner, gid_t group)
+{
+    if (::chown(path.c_str(), owner, group) == -1)
+        throw SysError("changing ownership of %s", PathFmt(path));
 }
 
 } // namespace nix

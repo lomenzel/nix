@@ -34,14 +34,13 @@ public:
      */
     std::shared_ptr<SourceAccessor> accessObject(const StorePath & path);
 
-    RemoteFSAccessor(
-        ref<Store> store, bool requireValidPath = true, std::optional<std::filesystem::path> cacheDir = {});
+    RemoteFSAccessor(ref<Store> store, bool requireValidPath = true, std::optional<AbsolutePath> cacheDir = {});
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override;
 
     DirEntries readDirectory(const CanonPath & path) override;
 
-    void readFile(const CanonPath & path, Sink & sink, std::function<void(uint64_t)> sizeCallback) override;
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
 
     using SourceAccessor::readFile;
 

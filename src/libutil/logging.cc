@@ -4,7 +4,6 @@
 #include "nix/util/terminal.hh"
 #include "nix/util/util.hh"
 #include "nix/util/config-global.hh"
-#include "nix/util/source-path.hh"
 #include "nix/util/position.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/unix-domain-socket.hh"
@@ -12,7 +11,6 @@
 #include <atomic>
 #include <sstream>
 #include <nlohmann/json.hpp>
-#include <iostream>
 
 namespace nix {
 
@@ -150,16 +148,21 @@ public:
 
 Verbosity verbosity = lvlInfo;
 
-void writeToStderr(std::string_view s)
+static void writeFullLogging(Descriptor fd, std::string_view s)
 {
     try {
-        writeFull(getStandardError(), s, false);
+        writeFull(fd, s, false);
     } catch (SystemError & e) {
-        /* Ignore failing writes to stderr.  We need to ignore write
-           errors to ensure that cleanup code that logs to stderr runs
-           to completion if the other side of stderr has been closed
-           unexpectedly. */
+        /* Ignore failing logging writes.  We need to ignore write
+           errors to ensure that cleanup code that writes logs runs
+           to completion if the other side of the logging fd has
+           been closed unexpectedly. */
     }
+}
+
+void writeToStderr(std::string_view s)
+{
+    writeFullLogging(getStandardError(), s);
 }
 
 std::unique_ptr<Logger> makeSimpleLogger(bool printBuildLogs)
@@ -245,15 +248,15 @@ struct JSONLogger : Logger
 
     void write(const nlohmann::json & json)
     {
-        auto line =
-            (includeNixPrefix ? "@nix " : "") + json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+        auto line = (includeNixPrefix ? "@nix " : "")
+                    + json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
 
         /* Acquire a lock to prevent log messages from clobbering each
            other. */
         try {
             auto state(_state.lock());
             if (state->enabled)
-                writeLine(fd, line);
+                writeFullLogging(fd, line);
         } catch (...) {
             bool enabled = false;
             std::swap(_state.lock()->enabled, enabled);

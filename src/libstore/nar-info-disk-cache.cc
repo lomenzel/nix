@@ -42,12 +42,18 @@ create table if not exists NARs (
     foreign key (cache) references BinaryCaches(id) on delete cascade
 );
 
-create table if not exists Realisations (
+create table if not exists BuildTrace (
     cache integer not null,
-    outputId text not null,
-    content blob, -- Json serialisation of the realisation, or null if the realisation is absent
+
+    drvPath text not null,
+    outputName text not null,
+
+    -- The following are null if the realisation is absent
+    outputPath text,
+    sigs text,
+
     timestamp        integer not null,
-    primary key (cache, outputId),
+    primary key (cache, drvPath, outputName),
     foreign key (cache) references BinaryCaches(id) on delete cascade
 );
 
@@ -66,7 +72,7 @@ struct NarInfoDiskCacheImpl : NarInfoDiskCache
     struct Cache
     {
         int id;
-        Path storeDir;
+        std::string storeDir;
         bool wantMassQuery;
         int priority;
     };
@@ -84,12 +90,12 @@ struct NarInfoDiskCacheImpl : NarInfoDiskCache
     NarInfoDiskCacheImpl(
         const Settings & settings,
         SQLiteSettings sqliteSettings,
-        Path dbPath = (getCacheDir() / "binary-cache-v7.sqlite").string())
+        std::filesystem::path dbPath = getCacheDir() / "binary-cache-v8.sqlite")
         : NarInfoDiskCache{settings}
     {
         auto state(_state.lock());
 
-        createDirs(dirOf(dbPath));
+        createDirs(dbPath.parent_path());
 
         state->db = SQLite(dbPath, SQLite::Settings{sqliteSettings});
 
@@ -120,29 +126,29 @@ struct NarInfoDiskCacheImpl : NarInfoDiskCache
         state->insertRealisation.create(
             state->db,
             R"(
-                insert or replace into Realisations(cache, outputId, content, timestamp)
-                    values (?, ?, ?, ?)
+                insert or replace into BuildTrace(cache, drvPath, outputName, outputPath, sigs, timestamp)
+                    values (?, ?, ?, ?, ?, ?)
             )");
 
         state->insertMissingRealisation.create(
             state->db,
             R"(
-                insert or replace into Realisations(cache, outputId, timestamp)
-                    values (?, ?, ?)
+                insert or replace into BuildTrace(cache, drvPath, outputName, timestamp)
+                    values (?, ?, ?, ?)
             )");
 
         state->queryRealisation.create(
             state->db,
             R"(
-                select content from Realisations
-                    where cache = ? and outputId = ?  and
-                        ((content is null and timestamp > ?) or
-                         (content is not null and timestamp > ?))
+                select outputPath, sigs from BuildTrace
+                    where cache = ? and drvPath = ? and outputName = ? and
+                        ((outputPath is null and timestamp > ?) or
+                         (outputPath is not null and timestamp > ?))
             )");
 
         /* Periodically purge expired entries from the database. */
         retrySQLite<void>([&]() {
-            auto now = time(0);
+            auto now = time(nullptr);
 
             SQLiteStmt queryLastPurge(state->db, "select value from LastPurge");
             auto queryLastPurge_(queryLastPurge.use());
@@ -181,7 +187,11 @@ private:
     {
         auto i = state.caches.find(uri);
         if (i == state.caches.end()) {
-            auto queryCache(state.queryCache.use()(uri)(time(0) - settings.ttlMeta));
+            /* Important: always use int64_t even on 32 bit systems. Otherwise
+               the the subtraction would promote time_t to unsigned if time_t is
+               32 bit. */
+            auto timestamp = static_cast<int64_t>(time(nullptr)) - static_cast<int64_t>(settings.ttlMeta.get());
+            auto queryCache(state.queryCache.use()(uri)(timestamp));
             if (!queryCache.next())
                 return std::nullopt;
             auto cache = Cache{
@@ -196,7 +206,7 @@ private:
     }
 
 public:
-    int createCache(const std::string & uri, const Path & storeDir, bool wantMassQuery, int priority) override
+    int createCache(const std::string & uri, const std::string & storeDir, bool wantMassQuery, int priority) override
     {
         return retrySQLite<int>([&]() {
             auto state(_state.lock());
@@ -217,7 +227,7 @@ public:
             };
 
             {
-                auto r(state->insertCache.use()(uri)(time(0))(storeDir) (wantMassQuery) (priority));
+                auto r(state->insertCache.use()(uri)(time(nullptr))(storeDir) (wantMassQuery) (priority));
                 if (!r.next()) {
                     unreachable();
                 }
@@ -251,7 +261,7 @@ public:
 
                 auto & cache(getCache(*state, uri));
 
-                auto now = time(0);
+                auto now = time(nullptr);
 
                 auto queryNAR(
                     state->queryNAR.use()(cache.id)(hashPart) (now - settings.ttlNegative)(now - settings.ttlPositive));
@@ -292,24 +302,29 @@ public:
 
                 auto & cache(getCache(*state, uri));
 
-                auto now = time(0);
+                auto now = time(nullptr);
 
-                auto queryRealisation(state->queryRealisation.use()(cache.id)(id.to_string())(
+                auto queryRealisation(state->queryRealisation.use()(cache.id)(id.drvPath.to_string())(id.outputName)(
                     now - settings.ttlNegative)(now - settings.ttlPositive));
 
                 if (!queryRealisation.next())
-                    return {oUnknown, 0};
+                    return {oUnknown, nullptr};
 
                 if (queryRealisation.isNull(0))
-                    return {oInvalid, 0};
+                    return {oInvalid, nullptr};
 
                 try {
                     return {
                         oValid,
-                        std::make_shared<Realisation>(nlohmann::json::parse(queryRealisation.getStr(0))),
+                        std::make_shared<Realisation>(
+                            UnkeyedRealisation{
+                                .outPath = StorePath{queryRealisation.getStr(0)},
+                                .signatures = nlohmann::json::parse(queryRealisation.getStr(1)),
+                            },
+                            id),
                     };
                 } catch (Error & e) {
-                    e.addTrace({}, "while parsing the local disk cache");
+                    e.addTrace({}, "reading build trace key-value from the local disk cache");
                     throw;
                 }
             });
@@ -338,11 +353,11 @@ public:
                         HashFormat::Nix32, true))(info->narSize)(concatStringsSep(" ", info->shortRefs()))(
                         info->deriver ? std::string(info->deriver->to_string()) : "",
                         (bool) info->deriver)(concatStringsSep(" ", Signature::toStrings(info->sigs)))(
-                        renderContentAddress(info->ca))(time(0))
+                        renderContentAddress(info->ca))(time(nullptr))
                     .exec();
 
             } else {
-                state->insertMissingNAR.use()(cache.id)(hashPart) (time(0)).exec();
+                state->insertMissingNAR.use()(cache.id)(hashPart) (time(nullptr)).exec();
             }
         });
     }
@@ -355,7 +370,9 @@ public:
             auto & cache(getCache(*state, uri));
 
             state->insertRealisation
-                .use()(cache.id)(realisation.id.to_string())(static_cast<nlohmann::json>(realisation).dump())(time(0))
+                .use()(cache.id)(realisation.id.drvPath.to_string())(realisation.id.outputName)(
+                    realisation.outPath.to_string())(static_cast<nlohmann::json>(realisation.signatures).dump())(
+                    time(nullptr))
                 .exec();
         });
     }
@@ -366,7 +383,8 @@ public:
             auto state(_state.lock());
 
             auto & cache(getCache(*state, uri));
-            state->insertMissingRealisation.use()(cache.id)(id.to_string())(time(0)).exec();
+            state->insertMissingRealisation.use()(cache.id)(id.drvPath.to_string())(id.outputName)(time(nullptr))
+                .exec();
         });
     }
 };
@@ -377,7 +395,8 @@ ref<NarInfoDiskCache> NarInfoDiskCache::get(const Settings & settings, SQLiteSet
     return cache;
 }
 
-ref<NarInfoDiskCache> NarInfoDiskCache::getTest(const Settings & settings, SQLiteSettings sqliteSettings, Path dbPath)
+ref<NarInfoDiskCache>
+NarInfoDiskCache::getTest(const Settings & settings, SQLiteSettings sqliteSettings, std::filesystem::path dbPath)
 {
     return make_ref<NarInfoDiskCacheImpl>(settings, sqliteSettings, dbPath);
 }

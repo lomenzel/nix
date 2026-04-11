@@ -3,10 +3,14 @@
 
 #include "nix/util/types.hh"
 #include "nix/util/error.hh"
+#include "nix/util/fun.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/file-path.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/ansicolor.hh"
+#include "nix/util/os-string.hh"
+
+#include <filesystem>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -19,6 +23,7 @@
 #include <map>
 #include <sstream>
 #include <optional>
+#include <thread>
 
 namespace nix {
 
@@ -31,6 +36,8 @@ class Pid
     pid_t pid = -1;
     bool separatePG = false;
     int killSignal = SIGKILL;
+    std::chrono::milliseconds killTimeout;
+    std::thread killThread;
 #else
     AutoCloseFD pid = INVALID_DESCRIPTOR;
 #endif
@@ -56,6 +63,7 @@ public:
 #ifndef _WIN32
     void setSeparatePG(bool separatePG);
     void setKillSignal(int signal);
+    void setKillTimeout(std::chrono::milliseconds duration);
     pid_t release();
 #endif
 
@@ -97,7 +105,7 @@ struct ProcessOptions
 };
 
 #ifndef _WIN32
-pid_t startProcess(std::function<void()> fun, const ProcessOptions & options = ProcessOptions());
+pid_t startProcess(fun<void()> processMain, const ProcessOptions & options = ProcessOptions());
 #endif
 
 /**
@@ -105,17 +113,17 @@ pid_t startProcess(std::function<void()> fun, const ProcessOptions & options = P
  * shell backtick operator).
  */
 std::string runProgram(
-    Path program,
+    std::filesystem::path program,
     bool lookupPath = false,
-    const Strings & args = Strings(),
+    const OsStrings & args = OsStrings(),
     const std::optional<std::string> & input = {},
     bool isInteractive = false);
 
 struct RunOptions
 {
-    Path program;
+    std::filesystem::path program;
     bool lookupPath = true;
-    Strings args;
+    OsStrings args;
 #ifndef _WIN32
     std::optional<uid_t> uid;
     std::optional<uid_t> gid;
@@ -133,14 +141,14 @@ std::pair<int, std::string> runProgram(RunOptions && options);
 
 void runProgram2(const RunOptions & options);
 
-class ExecError : public Error
+class ExecError final : public CloneableError<ExecError, Error>
 {
 public:
     int status;
 
     template<typename... Args>
     ExecError(int status, const Args &... args)
-        : Error(args...)
+        : CloneableError(args...)
         , status(status)
     {
     }

@@ -1,16 +1,9 @@
-#include "nix/util/util.hh"
 #include "nix/util/serialise.hh"
-#include "nix/util/types.hh"
 #include "nix/util/file-system.hh"
-#include "nix/util/processes.hh"
-#include "nix/util/terminal.hh"
-#include "nix/util/strings.hh"
 
 #include <limits.h>
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
-
-#include <numeric>
 
 using namespace std::string_view_literals;
 
@@ -62,9 +55,10 @@ TEST(absPath, usesOptionalBasePathWhenGiven)
     OsChar _cwd[PATH_MAX + 1];
     OsChar * cwd = GET_CWD((OsChar *) &_cwd, PATH_MAX);
 
-    auto p = absPath(std::filesystem::path{""}.string(), std::filesystem::path{cwd}.string());
+    auto cwdPath = std::filesystem::path{cwd};
+    auto p = absPath("", &cwdPath);
 
-    ASSERT_EQ(p, std::filesystem::path{cwd}.string());
+    ASSERT_EQ(p, cwdPath);
 }
 
 TEST(absPath, isIdempotent)
@@ -120,30 +114,7 @@ TEST(canonPath, requiresAbsolutePath)
     ASSERT_ANY_THROW(canonPath("."sv));
     ASSERT_ANY_THROW(canonPath(".."sv));
     ASSERT_ANY_THROW(canonPath("../"sv));
-    ASSERT_DEATH({ canonPath(""sv); }, "path != \"\"");
-}
-
-/* ----------------------------------------------------------------------------
- * dirOf
- * --------------------------------------------------------------------------*/
-
-TEST(dirOf, returnsEmptyStringForRoot)
-{
-    auto p = dirOf("/");
-
-    ASSERT_EQ(p, "/");
-}
-
-TEST(dirOf, returnsFirstPathComponent)
-{
-    auto p1 = dirOf("/dir/");
-    ASSERT_EQ(p1, "/dir");
-    auto p2 = dirOf("/dir");
-    ASSERT_EQ(p2, "/");
-    auto p3 = dirOf("/dir/..");
-    ASSERT_EQ(p3, "/dir");
-    auto p4 = dirOf("/dir/../");
-    ASSERT_EQ(p4, "/dir/..");
+    ASSERT_DEATH({ canonPath(""sv); }, "!path.empty\\(\\)");
 }
 
 /* ----------------------------------------------------------------------------
@@ -303,11 +274,13 @@ TEST(makeParentCanonical, root)
  * chmodIfNeeded
  * --------------------------------------------------------------------------*/
 
-#ifndef _WIN32
-// Windows doesn't support Unix-style permission bits - lstat always
-// returns the same mode regardless of what chmod sets.
 TEST(chmodIfNeeded, works)
 {
+#ifdef _WIN32
+    // Windows doesn't support Unix-style permission bits - lstat always
+    // returns the same mode regardless of what chmod sets.
+    GTEST_SKIP() << "Broken on Windows";
+#endif
     auto [autoClose_, tmpFile] = nix::createTempFile();
     auto deleteTmpFile = AutoDelete(tmpFile);
 
@@ -321,7 +294,6 @@ TEST(chmodIfNeeded, works)
         }
     }
 }
-#endif
 
 TEST(chmodIfNeeded, nonexistent)
 {

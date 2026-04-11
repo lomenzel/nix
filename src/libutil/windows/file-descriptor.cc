@@ -14,88 +14,66 @@
 
 namespace nix {
 
-using namespace nix::windows;
-
 std::make_unsigned_t<off_t> getFileSize(Descriptor fd)
 {
     LARGE_INTEGER li;
-    if (!GetFileSizeEx(fd, &li))
-        throw WinError("GetFileSizeEx");
+    if (!GetFileSizeEx(fd, &li)) {
+        throw windows::WinError([&] { return HintFmt("getting size of file %s", PathFmt(descriptorToPath(fd))); });
+    }
     return li.QuadPart;
-}
-
-void readFull(HANDLE handle, char * buf, size_t count)
-{
-    while (count) {
-        checkInterrupt();
-        DWORD res;
-        if (!ReadFile(handle, (char *) buf, count, &res, NULL))
-            throw WinError("%s:%d reading from file", __FILE__, __LINE__);
-        if (res == 0)
-            throw EndOfFile("unexpected end-of-file");
-        count -= res;
-        buf += res;
-    }
-}
-
-void writeFull(HANDLE handle, std::string_view s, bool allowInterrupts)
-{
-    while (!s.empty()) {
-        if (allowInterrupts)
-            checkInterrupt();
-        DWORD res;
-        if (!WriteFile(handle, s.data(), s.size(), &res, NULL)) {
-            // Do this because `descriptorToPath` will overwrite the last error.
-            auto lastError = GetLastError();
-            auto path = descriptorToPath(handle);
-            throw WinError(lastError, "writing to file %d:%s", handle, PathFmt(path));
-        }
-        if (res > 0)
-            s.remove_prefix(res);
-    }
-}
-
-std::string readLine(HANDLE handle, bool eofOk, char terminator)
-{
-    std::string s;
-    while (1) {
-        checkInterrupt();
-        char ch;
-        // FIXME: inefficient
-        DWORD rd;
-        if (!ReadFile(handle, &ch, 1, &rd, NULL)) {
-            throw WinError("reading a line");
-        } else if (rd == 0) {
-            if (eofOk)
-                return s;
-            else
-                throw EndOfFile("unexpected EOF reading a line");
-        } else {
-            if (ch == terminator)
-                return s;
-            s += ch;
-        }
-    }
 }
 
 size_t read(Descriptor fd, std::span<std::byte> buffer)
 {
+    checkInterrupt(); // For consistency with unix, and its EINTR loop
     DWORD n;
-    if (!ReadFile(fd, buffer.data(), static_cast<DWORD>(buffer.size()), &n, NULL))
-        throw WinError("ReadFile of %1% bytes", buffer.size());
+    if (!ReadFile(fd, buffer.data(), static_cast<DWORD>(buffer.size()), &n, NULL)) {
+        auto lastError = GetLastError();
+        if (lastError == ERROR_BROKEN_PIPE)
+            n = 0; // Treat as EOF
+        else
+            throw windows::WinError(
+                lastError, "reading %1% bytes from %2%", buffer.size(), PathFmt(descriptorToPath(fd)));
+    }
     return static_cast<size_t>(n);
 }
 
 size_t readOffset(Descriptor fd, off_t offset, std::span<std::byte> buffer)
 {
+    checkInterrupt(); // For consistency with unix, and its EINTR loop
     OVERLAPPED ov = {};
     ov.Offset = static_cast<DWORD>(offset);
     if constexpr (sizeof(offset) > 4) /* We don't build with 32 bit off_t, but let's be safe. */
         ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
     DWORD n;
-    if (!ReadFile(fd, buffer.data(), static_cast<DWORD>(buffer.size()), &n, &ov))
-        throw WinError("ReadFile of %1% bytes at offset %2%", buffer.size(), offset);
+    if (!ReadFile(fd, buffer.data(), static_cast<DWORD>(buffer.size()), &n, &ov)) {
+        throw windows::WinError([&] {
+            return HintFmt(
+                "reading %1% bytes at offset %2% from %3%", buffer.size(), offset, PathFmt(descriptorToPath(fd)));
+        });
+    }
     return static_cast<size_t>(n);
+}
+
+size_t write(Descriptor fd, std::span<const std::byte> buffer, bool allowInterrupts)
+{
+    if (allowInterrupts)
+        checkInterrupt(); // For consistency with unix
+    DWORD n;
+    if (!WriteFile(fd, buffer.data(), static_cast<DWORD>(buffer.size()), &n, NULL)) {
+        throw windows::WinError(
+            [&] { return HintFmt("writing %1% bytes to %2%", buffer.size(), PathFmt(descriptorToPath(fd))); });
+    }
+    return static_cast<size_t>(n);
+}
+
+AutoCloseFD dupDescriptor(Descriptor fd)
+{
+    HANDLE newHandle;
+    if (!DuplicateHandle(GetCurrentProcess(), fd, GetCurrentProcess(), &newHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        throw windows::WinError("duplicating handle");
+    }
+    return AutoCloseFD{newHandle};
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -109,7 +87,7 @@ void Pipe::create()
 
     HANDLE hReadPipe, hWritePipe;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &saAttr, 0))
-        throw WinError("CreatePipe");
+        throw windows::WinError("CreatePipe");
 
     readSide = hReadPipe;
     writeSide = hWritePipe;
@@ -150,8 +128,9 @@ off_t lseek(HANDLE h, off_t offset, int whence)
 
 void syncDescriptor(Descriptor fd)
 {
-    if (!::FlushFileBuffers(fd))
-        throw WinError("FlushFileBuffers file descriptor %1%", fd);
+    if (!::FlushFileBuffers(fd)) {
+        throw windows::WinError([&] { return HintFmt("flushing file %s", PathFmt(descriptorToPath(fd))); });
+    }
 }
 
 } // namespace nix

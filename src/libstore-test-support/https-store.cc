@@ -1,4 +1,5 @@
 #include "nix/store/tests/https-store.hh"
+#include "nix/util/os-string.hh"
 
 #include <thread>
 
@@ -21,7 +22,7 @@ ref<TestHttpBinaryCacheStore> TestHttpBinaryCacheStoreConfig::openTestStore(ref<
 
 void HttpsBinaryCacheStoreTest::openssl(Strings args)
 {
-    runProgram("openssl", /*lookupPath=*/true, args);
+    runProgram("openssl", /*lookupPath=*/true, toOsStrings(std::move(args)));
 }
 
 void HttpsBinaryCacheStoreTest::SetUp()
@@ -37,8 +38,7 @@ void HttpsBinaryCacheStoreTest::SetUp()
     delTmpDir = std::make_unique<AutoDelete>(tmpDir);
 
     localCacheStore =
-        make_ref<LocalBinaryCacheStoreConfig>("file", cacheDir.string(), LocalBinaryCacheStoreConfig::Params{})
-            ->openStore();
+        make_ref<LocalBinaryCacheStoreConfig>(cacheDir, LocalBinaryCacheStoreConfig::Params{})->openStore();
 
     caCert = tmpDir / "ca.crt";
     caKey = tmpDir / "ca.key";
@@ -60,7 +60,7 @@ void HttpsBinaryCacheStoreTest::SetUp()
     openssl({"x509", "-req", "-in", (tmpDir / "client.csr").string(), "-CA", caCert.string(), "-CAkey", caKey.string(), "-CAcreateserial", "-out", clientCert.string(), "-days", "1"});
     // clang-format on
 
-#ifndef _WIN32 /* FIXME: Can't yet start processes on windows */
+#ifndef _WIN32 /* FIXME: Can't yet start background processes on windows */
     auto args = serverArgs();
     serverPid = startProcess(
         [&] {
@@ -91,7 +91,9 @@ void HttpsBinaryCacheStoreTest::SetUp()
 
 void HttpsBinaryCacheStoreTest::TearDown()
 {
+#ifndef _WIN32 /* FIXME: Can't yet start background processes on windows */
     serverPid.kill();
+#endif
     delTmpDir.reset();
     testFileTransferSettings.reset();
 }

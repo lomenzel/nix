@@ -1,6 +1,7 @@
 #include "nix/store/s3-binary-cache-store.hh"
 #include "nix/store/http-binary-cache-store.hh"
 #include "nix/store/store-registration.hh"
+#include "nix/util/compression.hh"
 #include "nix/util/error.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/serialise.hh"
@@ -161,11 +162,11 @@ void S3BinaryCacheStore::upsertFile(
 
     try {
         if (auto compressionMethod = getCompressionMethod(path)) {
-            CompressedSource compressed(source, *compressionMethod);
+            StringSource compressed(compress(*compressionMethod, source));
             /* TODO: Validate that this is a valid content encoding. We probably shouldn't set non-standard values here.
              */
             Headers headers = {{"Content-Encoding", showCompressionAlgo(*compressionMethod)}};
-            doUpload(compressed, compressed.size(), std::move(headers));
+            doUpload(compressed, compressed.s.size(), std::move(headers));
         } else {
             doUpload(source, sizeHint, std::nullopt);
         }
@@ -416,10 +417,9 @@ StringSet S3BinaryCacheStoreConfig::uriSchemes()
     return {"s3"};
 }
 
-S3BinaryCacheStoreConfig::S3BinaryCacheStoreConfig(
-    std::string_view scheme, std::string_view _cacheUri, const Params & params)
-    : StoreConfig(params)
-    , HttpBinaryCacheStoreConfig(scheme, _cacheUri, params)
+S3BinaryCacheStoreConfig::S3BinaryCacheStoreConfig(ParsedURL cacheUri_, const Params & params)
+    : StoreConfig(params, FilePathType::Unix)
+    , HttpBinaryCacheStoreConfig(std::move(cacheUri_), params)
 {
     assert(cacheUri.query.empty());
     assert(cacheUri.scheme == "s3");
@@ -453,6 +453,12 @@ S3BinaryCacheStoreConfig::S3BinaryCacheStoreConfig(
             renderSize(multipartThreshold.get()),
             renderSize(multipartChunkSize.get()));
     }
+}
+
+S3BinaryCacheStoreConfig::S3BinaryCacheStoreConfig(std::string_view bucketName, const Params & params)
+    : S3BinaryCacheStoreConfig(
+          ParsedURL{.scheme = "s3", .authority = ParsedURL::Authority{.host = std::string(bucketName)}}, params)
+{
 }
 
 std::string S3BinaryCacheStoreConfig::getHumanReadableURI() const

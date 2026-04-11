@@ -300,11 +300,11 @@ struct StorePathCommand : public StorePathsCommand
  */
 struct RegisterCommand
 {
-    typedef std::map<std::vector<std::string>, std::function<ref<Command>()>> Commands;
+    typedef std::map<std::vector<std::string>, fun<ref<Command>()>> Commands;
 
     static Commands & commands();
 
-    RegisterCommand(std::vector<std::string> && name, std::function<ref<Command>()> command)
+    RegisterCommand(std::vector<std::string> && name, fun<ref<Command>()> command)
     {
         commands().emplace(name, command);
     }
@@ -407,7 +407,7 @@ void createOutLinks(const std::filesystem::path & outLink, const BuiltPaths & bu
 struct MixOutLinkBase : virtual Args
 {
     /** Prefix for any output symlinks. Empty means do not write an output symlink. */
-    Path outLink;
+    std::filesystem::path outLink;
 
     MixOutLinkBase(const std::string & defaultOutLink)
         : outLink(defaultOutLink)
@@ -435,7 +435,7 @@ struct MixOutLinkByDefault : MixOutLinkBase, virtual Args
         addFlag({
             .longName = "no-link",
             .description = "Do not create symlinks to the build results.",
-            .handler = {&outLink, Path("")},
+            .handler = {&outLink, std::filesystem::path{}},
         });
     }
 };

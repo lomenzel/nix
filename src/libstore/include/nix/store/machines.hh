@@ -17,7 +17,7 @@ struct Machine
 
     const StoreReference storeUri;
     const StringSet systemTypes;
-    const std::string sshKey;
+    const std::optional<std::filesystem::path> sshKey;
     const unsigned int maxJobs;
     const float speedFactor;
     const StringSet supportedFeatures;

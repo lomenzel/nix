@@ -15,7 +15,7 @@ namespace nix::fetchers {
 DownloadFileResult downloadFile(
     Store & store,
     const Settings & settings,
-    const std::string & url,
+    const VerbatimURL & url,
     const std::string & name,
     const Headers & headers)
 {
@@ -24,7 +24,7 @@ DownloadFileResult downloadFile(
     Cache::Key key{
         "file",
         {{
-            {"url", url},
+            {"url", url.to_string()},
             {"name", name},
         }}};
 
@@ -42,7 +42,7 @@ DownloadFileResult downloadFile(
     if (cached && !cached->expired)
         return useCached();
 
-    FileTransferRequest request(VerbatimURL{url});
+    FileTransferRequest request(url);
     request.headers = headers;
     if (cached)
         request.expectedETag = getStrAttr(cached->value, "etag");
@@ -51,7 +51,7 @@ DownloadFileResult downloadFile(
         res = getFileTransfer()->download(request);
     } catch (FileTransferError & e) {
         if (cached) {
-            warn("%s; using cached version", e.msg());
+            warn("%s; using cached version", e.message());
             return useCached();
         } else
             throw;
@@ -113,7 +113,7 @@ static DownloadTarballResult downloadTarball_(
     // Namely lets catch when the url is a local file path, but
     // it is not in fact a tarball.
     if (url.scheme == "file") {
-        std::filesystem::path localPath = renderUrlPathEnsureLegal(url.path);
+        std::filesystem::path localPath = urlPathToPath(url.path);
         if (!localPath.is_absolute()) {
             throw Error(
                 "tarball '%s' must use an absolute path. "
@@ -179,7 +179,7 @@ static DownloadTarballResult downloadTarball_(
         auto [fdTemp, path] = createTempFile("nix-zipfile");
         cleanupTemp.cancel();
         cleanupTemp = {path};
-        debug("downloading '%s' into '%s'...", url, path);
+        debug("downloading '%s' into %s...", url, PathFmt(path));
         {
             FdSink sink(fdTemp.get());
             source->drainInto(sink);

@@ -10,7 +10,7 @@
 
 namespace nix {
 
-struct TimedOut : BuildError
+struct TimedOut final : CloneableError<TimedOut, BuildError>
 {
     time_t maxDuration;
 
@@ -79,6 +79,11 @@ private:
      * Goals that this goal is waiting for.
      */
     Goals waitees;
+
+    /**
+     * Memoised result of key().
+     */
+    std::optional<std::string> cachedKey;
 
 public:
     typedef enum { ecBusy, ecSuccess, ecFailed, ecNoSubstituters } ExitCode;
@@ -253,6 +258,12 @@ public:
         void await_resume() {};
     };
 
+    template<typename T>
+    struct AsyncCallback
+    {
+        fun<void(Callback<T>)> fn;
+    };
+
     /**
      * Used on initial suspend, does the same as `std::suspend_always`,
      * but asserts that everything has been set correctly.
@@ -423,6 +434,9 @@ public:
             return static_cast<Co &&>(co);
         }
 
+        template<typename T>
+        auto await_transform(AsyncCallback<T> && acb);
+
         /**
          * Awaiter for @ref Suspend. Always suspends, but asserts
          * there are no pending child events (those should be
@@ -592,6 +606,17 @@ public:
     virtual std::string key() = 0;
 
     /**
+     * Memoising variant of key(). We really don't want to pay the overhead of
+     * allocating strings just to compare Goals.
+     */
+    std::string_view keyCached() &
+    {
+        if (cachedKey)
+            return *cachedKey;
+        return *(cachedKey = key());
+    }
+
+    /**
      * @brief Hint for the scheduler, which concurrency limit applies.
      * @see JobCategory
      */
@@ -600,7 +625,19 @@ public:
 protected:
     Co await(Goals waitees);
 
+    /**
+     * Awaiting on the resulting coroutine yields the goal for several seconds.
+     * Used for retrying goals blocked on acquiring lockfiles.
+     */
     Co waitForAWhile();
+
+    /**
+     * Awaiting on the resulting coroutine yields the goal until it is
+     * explicitly woken up via Worker::wakeUp. Wakeup can be queued from another
+     * thread via Worker::Waker.
+     */
+    Co waitUntilWoken();
+
     Co waitForBuildSlot();
     Co yield();
 };

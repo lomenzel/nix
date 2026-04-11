@@ -4,6 +4,7 @@
 #include "nix/util/executable-path.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/file-path.hh"
+#include "nix/util/fmt.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/processes.hh"
@@ -15,6 +16,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <iostream>
 #include <sstream>
@@ -23,14 +25,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#ifdef _WIN32
-
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 namespace nix {
-
-using namespace nix::windows;
 
 Pid::Pid() {}
 
@@ -64,7 +62,7 @@ int Pid::kill(bool allowInterrupts)
     debug("killing process %1%", pid.get());
 
     if (!TerminateProcess(pid.get(), 1))
-        logError(WinError("terminating process %1%", pid.get()).info());
+        logError(windows::WinError("terminating process %1%", pid.get()).info());
 
     return wait(allowInterrupts);
 }
@@ -76,11 +74,11 @@ int Pid::wait(bool allowInterrupts)
     assert(pid.get() != INVALID_DESCRIPTOR);
     DWORD status = WaitForSingleObject(pid.get(), INFINITE);
     if (status != WAIT_OBJECT_0)
-        throw WinError("waiting for process %1%", pid.get());
+        throw windows::WinError("waiting for process %1%", pid.get());
 
     DWORD exitCode = 0;
     if (GetExitCodeProcess(pid.get(), &exitCode) == FALSE)
-        throw WinError("getting exit code of process %1%", pid.get());
+        throw windows::WinError("getting exit code of process %1%", pid.get());
 
     pid.close();
     return exitCode;
@@ -88,7 +86,11 @@ int Pid::wait(bool allowInterrupts)
 
 // TODO: Merge this with Unix's runProgram since it's identical logic.
 std::string runProgram(
-    Path program, bool lookupPath, const Strings & args, const std::optional<std::string> & input, bool isInteractive)
+    std::filesystem::path program,
+    bool lookupPath,
+    const OsStrings & args,
+    const std::optional<std::string> & input,
+    bool isInteractive)
 {
     auto res = runProgram(
         RunOptions{
@@ -99,17 +101,17 @@ std::string runProgram(
             .isInteractive = isInteractive});
 
     if (!statusOk(res.first))
-        throw ExecError(res.first, "program '%1%' %2%", program, statusToString(res.first));
+        throw ExecError(res.first, "program %s %s", PathFmt(program), statusToString(res.first));
 
     return res.second;
 }
 
-std::optional<Path> getProgramInterpreter(const Path & program)
+std::optional<std::filesystem::path> getProgramInterpreter(const std::filesystem::path & program)
 {
     // These extensions are automatically handled by Windows and don't require an interpreter.
     static constexpr const char * exts[] = {".exe", ".cmd", ".bat"};
     for (const auto ext : exts) {
-        if (hasSuffix(program, ext)) {
+        if (hasSuffix(program.string(), ext)) {
             return {};
         }
     }
@@ -122,7 +124,7 @@ void setFDInheritable(AutoCloseFD & fd, bool inherit)
 {
     if (fd.get() != INVALID_DESCRIPTOR) {
         if (!SetHandleInformation(fd.get(), HANDLE_FLAG_INHERIT, inherit ? HANDLE_FLAG_INHERIT : 0)) {
-            throw WinError("Couldn't disable inheriting of handle");
+            throw windows::WinError("Couldn't disable inheriting of handle");
         }
     }
 }
@@ -142,7 +144,7 @@ AutoCloseFD nullFD()
         0,
         NULL);
     if (!nul.get()) {
-        throw WinError("Couldn't open NUL device");
+        throw windows::WinError("Couldn't open NUL device");
     }
     // Let this handle be inheritable by child processes
     setFDInheritable(nul, true);
@@ -151,23 +153,23 @@ AutoCloseFD nullFD()
 
 // Adapted from
 // https://blogs.msdn.microsoft.com/twistylittlepassagesallalike/2011/04/23/everyone-quotes-command-line-arguments-the-wrong-way/
-std::string windowsEscape(const std::string & str, bool cmd)
+OsString windowsEscape(const OsString & str, bool cmd)
 {
     // TODO: This doesn't handle cmd.exe escaping.
     if (cmd) {
         throw UnimplementedError("cmd.exe escaping is not implemented");
     }
 
-    if (str.find_first_of(" \t\n\v\"") == str.npos && !str.empty()) {
+    if (str.find_first_of(L" \t\n\v\"") == str.npos && !str.empty()) {
         // No need to escape this one, the nonempty contents don't have a special character
         return str;
     }
-    std::string buffer;
+    OsString buffer;
     // Add the opening quote
-    buffer += '"';
+    buffer += L'"';
     for (auto iter = str.begin();; ++iter) {
         size_t backslashes = 0;
-        while (iter != str.end() && *iter == '\\') {
+        while (iter != str.end() && *iter == L'\\') {
             ++iter;
             ++backslashes;
         }
@@ -178,24 +180,24 @@ std::string windowsEscape(const std::string & str, bool cmd)
         // Both of these cases break the escaping if not handled. Otherwise backslashes are fine as-is
         if (iter == str.end()) {
             // Need to escape each backslash
-            buffer.append(backslashes * 2, '\\');
+            buffer.append(backslashes * 2, L'\\');
             // Exit since we've reached the end of the string
             break;
-        } else if (*iter == '"') {
+        } else if (*iter == L'"') {
             // Need to escape each backslash and the intermediate quote character
-            buffer.append(backslashes * 2, '\\');
-            buffer += "\\\"";
+            buffer.append(backslashes * 2, L'\\');
+            buffer += L"\\\"";
         } else {
             // Don't escape the backslashes since they won't break the delimiter
-            buffer.append(backslashes, '\\');
+            buffer.append(backslashes, L'\\');
             buffer += *iter;
         }
     }
     // Add the closing quote
-    return buffer + '"';
+    return buffer + L'"';
 }
 
-Pid spawnProcess(const Path & realProgram, const RunOptions & options, Pipe & out, Pipe & in)
+Pid spawnProcess(const std::filesystem::path & realProgram, const RunOptions & options, Pipe & out, Pipe & in)
 {
     // Setup pipes.
     if (options.standardOut) {
@@ -232,18 +234,19 @@ Pid spawnProcess(const Path & realProgram, const RunOptions & options, Pipe & ou
         envline += (envVar.first + L'=' + envVar.second + L'\0');
     }
 
-    std::string cmdline = windowsEscape(realProgram, false);
+    OsString cmdline = windowsEscape(realProgram.native(), false);
     for (const auto & arg : options.args) {
         // TODO: This isn't the right way to escape windows command
         // See https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw
-        cmdline += ' ' + windowsEscape(arg, false);
+        cmdline += L' ';
+        cmdline += windowsEscape(arg, false);
     }
 
     PROCESS_INFORMATION procInfo = {0};
     if (CreateProcessW(
             // EXE path is provided in the cmdline
             NULL,
-            string_to_os_string(cmdline).data(),
+            cmdline.data(),
             NULL,
             NULL,
             TRUE,
@@ -253,7 +256,7 @@ Pid spawnProcess(const Path & realProgram, const RunOptions & options, Pipe & ou
             &startInfo,
             &procInfo)
         == 0) {
-        throw WinError("CreateProcessW failed (%1%)", cmdline);
+        throw windows::WinError("CreateProcessW failed (%1%)", os_string_to_string(cmdline));
     }
 
     // Convert these to use RAII
@@ -266,15 +269,15 @@ Pid spawnProcess(const Path & realProgram, const RunOptions & options, Pipe & ou
     Descriptor job = CreateJobObjectW(NULL, NULL);
     if (job == NULL) {
         TerminateProcess(procInfo.hProcess, 0);
-        throw WinError("Couldn't create job object for child process");
+        throw windows::WinError("Couldn't create job object for child process");
     }
     if (AssignProcessToJobObject(job, procInfo.hProcess) == FALSE) {
         TerminateProcess(procInfo.hProcess, 0);
-        throw WinError("Couldn't assign child process to job object");
+        throw windows::WinError("Couldn't assign child process to job object");
     }
     if (ResumeThread(procInfo.hThread) == (DWORD) -1) {
         TerminateProcess(procInfo.hProcess, 0);
-        throw WinError("Couldn't resume child process thread");
+        throw windows::WinError("Couldn't resume child process thread");
     }
 
     return process;
@@ -321,7 +324,7 @@ void runProgram2(const RunOptions & options)
     if (source)
         in.create();
 
-    Path realProgram = options.program;
+    std::filesystem::path realProgram = options.program;
     // TODO: Implement shebang / program interpreter lookup on Windows
     auto interpreter = getProgramInterpreter(realProgram);
 
@@ -374,7 +377,7 @@ void runProgram2(const RunOptions & options)
         promise.get_future().get();
 
     if (status)
-        throw ExecError(status, "program '%1%' %2%", options.program, statusToString(status));
+        throw ExecError(status, "program %1% %2%", PathFmt(options.program), statusToString(status));
 }
 
 std::string statusToString(int status)
@@ -397,5 +400,3 @@ int execvpe(const wchar_t * file0, const wchar_t * const argv[], const wchar_t *
 }
 
 } // namespace nix
-
-#endif

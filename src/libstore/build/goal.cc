@@ -1,11 +1,11 @@
 #include "nix/store/build/goal.hh"
 #include "nix/store/build/worker.hh"
-#include "nix/store/globals.hh"
+#include "nix/store/worker-settings.hh"
 
 namespace nix {
 
 TimedOut::TimedOut(time_t maxDuration)
-    : BuildError(BuildResult::Failure::TimedOut, "timed out after %1% seconds", maxDuration)
+    : CloneableError(BuildResult::Failure::TimedOut, "timed out after %1% seconds", maxDuration)
     , maxDuration(maxDuration)
 {
 }
@@ -157,9 +157,7 @@ std::coroutine_handle<> nix::Goal::Co::await_suspend(handle_type caller)
 
 bool CompareGoalPtrs::operator()(const GoalPtr & a, const GoalPtr & b) const
 {
-    std::string s1 = a->key();
-    std::string s2 = b->key();
-    return s1 < s2;
+    return a->keyCached() < b->keyCached();
 }
 
 void addToWeakGoals(WeakGoals & goals, GoalPtr p)
@@ -304,6 +302,13 @@ Goal::Co Goal::yield()
 Goal::Co Goal::waitForAWhile()
 {
     worker.waitForAWhile(shared_from_this());
+    co_await Suspend{};
+    co_return Return{};
+}
+
+Goal::Co Goal::waitUntilWoken()
+{
+    worker.waitForCompletion(shared_from_this());
     co_await Suspend{};
     co_return Return{};
 }

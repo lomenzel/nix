@@ -1,15 +1,12 @@
 #include "nix/store/profiles.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/globals.hh"
-#include "nix/store/store-api.hh"
 #include "nix/store/local-fs-store.hh"
 #include "nix/util/users.hh"
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <errno.h>
-#include <stdio.h>
 
 namespace nix {
 
@@ -25,7 +22,7 @@ static std::optional<GenerationNumber> parseName(const std::string & profileName
     auto p = s.find("-link");
     if (p == std::string::npos)
         return {};
-    if (auto n = string2Int<unsigned int>(s.substr(0, p)))
+    if (auto n = string2Int<GenerationNumber>(s.substr(0, p)))
         return *n;
     else
         return {};
@@ -234,7 +231,7 @@ time_t parseOlderThanTimeSpec(std::string_view timeSpec)
     if (timeSpec.empty() || timeSpec[timeSpec.size() - 1] != 'd')
         throw UsageError("invalid number of days specifier '%1%', expected something like '14d'", timeSpec);
 
-    time_t curTime = time(0);
+    time_t curTime = time(nullptr);
     auto strDays = timeSpec.substr(0, timeSpec.size() - 1);
     auto days = string2Int<int>(strDays);
 
@@ -293,8 +290,7 @@ std::string optimisticLockProfile(const std::filesystem::path & profile)
 
 std::filesystem::path profilesDir(ProfileDirsOptions settings)
 {
-    auto profileRoot =
-        isRootUser() ? rootProfilesDir(settings) : std::filesystem::path{createNixStateDir()} / "profiles";
+    auto profileRoot = isRootUser() ? rootProfilesDir(settings) : createNixStateDir() / "profiles";
     createDirs(profileRoot);
     return profileRoot;
 }
@@ -306,9 +302,8 @@ std::filesystem::path rootProfilesDir(ProfileDirsOptions settings)
 
 std::filesystem::path getDefaultProfile(ProfileDirsOptions settings)
 {
-    std::filesystem::path profileLink = settings.useXDGBaseDirectories
-                                            ? std::filesystem::path{createNixStateDir()} / "profile"
-                                            : std::filesystem::path{getHome()} / ".nix-profile";
+    std::filesystem::path profileLink =
+        settings.useXDGBaseDirectories ? createNixStateDir() / "profile" : getHome() / ".nix-profile";
     try {
         auto profile = profilesDir(settings) / "profile";
         if (!pathExists(profileLink)) {

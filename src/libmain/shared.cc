@@ -6,12 +6,10 @@
 #include "nix/store/store-open.hh"
 #include "nix/store/gc-store.hh"
 #include "nix/main/loggers.hh"
-#include "nix/main/progress-bar.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/util.hh"
 
 #include <algorithm>
-#include <exception>
 #include <iostream>
 
 #include <cstdlib>
@@ -135,7 +133,14 @@ void bumpFileLimit()
         return;
 
     if (limit.rlim_cur < limit.rlim_max) {
-        limit.rlim_cur = limit.rlim_max;
+        // Some software misbehaves really bad when we try to raise the
+        // limit to RLIM_INFINITY, so cap the limit at the 1048576 limit used
+        // by the daemon.
+        //
+        // GNU patch < 2.8 crashes with **** out of memory, which breaks in nixpkgs darwin bootstrap tools.
+        // This was fixed in:
+        // https://cgit.git.savannah.gnu.org/cgit/patch.git/commit/?id=61d7788b83b302207a67b82786f4fd79e3538f30
+        limit.rlim_cur = std::min(limit.rlim_max, rlim_t(1048576));
         // Ignore errors, this is best effort.
         setrlimit(RLIMIT_NOFILE, &limit);
     }
@@ -164,10 +169,10 @@ void initNix(bool loadConfig)
     if (sigaction(SIGCHLD, &act, 0))
         throw SysError("resetting SIGCHLD");
 
-    /* Install a dummy SIGUSR1 handler for use with pthread_kill(). */
+    /* Install a dummy NIX_SIG_MULTI_INT handler for use with pthread_kill(). */
     act.sa_handler = sigHandler;
-    if (sigaction(SIGUSR1, &act, 0))
-        throw SysError("handling SIGUSR1");
+    if (sigaction(NIX_SIG_MULTI_INT, &act, 0))
+        throw SysError("handling multiplexed interrupt");
 #endif
 
 #ifdef __APPLE__
@@ -214,8 +219,7 @@ void initNix(bool loadConfig)
 }
 
 LegacyArgs::LegacyArgs(
-    const std::string & programName,
-    std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
+    const std::string & programName, fun<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
     : MixCommonArgs(programName)
     , parseArg(parseArg)
 {
@@ -306,8 +310,7 @@ bool LegacyArgs::processArgs(const Strings & args, bool finish)
     return true;
 }
 
-void parseCmdLine(
-    int argc, char ** argv, std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
+void parseCmdLine(int argc, char ** argv, fun<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
 {
     parseCmdLine(std::string(baseNameOf(argv[0])), argvToStrings(argc, argv), parseArg);
 }
@@ -315,7 +318,7 @@ void parseCmdLine(
 void parseCmdLine(
     const std::string & programName,
     const Strings & args,
-    std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
+    fun<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
 {
     LegacyArgs(programName, parseArg).parseCmdline(args);
 }
@@ -332,12 +335,12 @@ void printVersion(const std::string & programName)
         std::cout << "System type: " << settings.thisSystem << "\n";
         std::cout << "Additional system types: " << concatStringsSep(", ", settings.extraPlatforms.get()) << "\n";
         std::cout << "Features: " << concatStringsSep(", ", cfg) << "\n";
-        std::cout << "System configuration file: " << nixConfFile() << "\n";
+        std::cout << "System configuration file: " << os_string_to_string(nixConfFile().native()) << "\n";
         std::cout << "User configuration files: "
                   << os_string_to_string(ExecutablePath{.directories = nixUserConfFiles()}.render()) << "\n";
         std::cout << "Store directory: " << resolveStoreConfig(StoreReference{settings.storeUri.get()})->storeDir
                   << "\n";
-        std::cout << "State directory: " << settings.nixStateDir << "\n";
+        std::cout << "State directory: " << os_string_to_string(settings.nixStateDir.native()) << "\n";
     }
     throw Exit();
 }

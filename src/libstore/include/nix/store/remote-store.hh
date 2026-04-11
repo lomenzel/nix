@@ -23,7 +23,10 @@ class RemoteFSAccessor;
 
 struct RemoteStoreConfig : virtual StoreConfig
 {
-    using StoreConfig::StoreConfig;
+    RemoteStoreConfig(const Params & params, FilePathType pathType)
+        : StoreConfig(params, pathType)
+    {
+    }
 
     Setting<int> maxConnections{
         this, 1, "max-connections", "Maximum number of concurrent connections to the Nix daemon."};
@@ -96,8 +99,6 @@ struct RemoteStore : public virtual Store, public virtual GcStore, public virtua
         RepairFlag repair = NoRepair) override;
 
     void addToStore(const ValidPathInfo & info, Source & nar, RepairFlag repair, CheckSigsFlag checkSigs) override;
-
-    void addMultipleToStore(Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override;
 
     void
     addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;

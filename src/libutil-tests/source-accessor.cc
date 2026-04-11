@@ -88,11 +88,14 @@ protected:
 
 TEST_F(FSSourceAccessorTest, works)
 {
+#ifdef _WIN32
+    GTEST_SKIP() << "Broken on Windows";
+#endif
     {
         RestoreSink sink(false);
         sink.dstPath = tmpDir;
 #ifndef _WIN32
-        sink.dirFd = openDirectory(tmpDir);
+        sink.dirFd = openDirectory(tmpDir, FinalSymlink::Follow);
 #endif
         sink.createDirectory(CanonPath("subdir"));
         sink.createRegularFile(CanonPath("file1"), [](CreateRegularFileSink & crf) { crf("content1"); });
@@ -124,9 +127,7 @@ TEST_F(FSSourceAccessorTest, works)
     }
 
     {
-        auto accessor = makeFSSourceAccessor(tmpDir / "nonexistent");
-        EXPECT_FALSE(accessor->maybeLstat(CanonPath::root));
-        EXPECT_THROW(accessor->readFile(CanonPath::root), SystemError);
+        EXPECT_THROW(makeFSSourceAccessor(tmpDir / "nonexistent"), SystemError);
     }
 
     {
@@ -156,6 +157,9 @@ TEST_F(FSSourceAccessorTest, RestoreSinkRegularFileAtRoot)
 
 TEST_F(FSSourceAccessorTest, RestoreSinkSymlinkAtRoot)
 {
+#ifdef _WIN32
+    GTEST_SKIP() << "symlinks have some problems under Wine";
+#endif
     auto linkPath = tmpDir / "rootlink";
     {
         RestoreSink sink(false);

@@ -25,7 +25,8 @@ struct NarInfoDiskCache
 
     virtual ~NarInfoDiskCache() {}
 
-    virtual int createCache(const std::string & uri, const Path & storeDir, bool wantMassQuery, int priority) = 0;
+    virtual int
+    createCache(const std::string & uri, const std::string & storeDir, bool wantMassQuery, int priority) = 0;
 
     struct CacheInfo
     {
@@ -59,7 +60,7 @@ struct NarInfoDiskCache
      */
     static ref<NarInfoDiskCache> get(const Settings & settings, SQLiteSettings);
 
-    static ref<NarInfoDiskCache> getTest(const Settings & settings, SQLiteSettings, Path dbPath);
+    static ref<NarInfoDiskCache> getTest(const Settings & settings, SQLiteSettings, std::filesystem::path dbPath);
 };
 
 } // namespace nix

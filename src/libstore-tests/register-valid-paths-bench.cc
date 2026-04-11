@@ -5,14 +5,13 @@
 #include "nix/store/store-open.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/hash.hh"
-#include "nix/util/tests/test-data.hh"
 
 #ifndef _WIN32
 
 #  include <filesystem>
 #  include <fstream>
 
-using namespace nix;
+namespace nix {
 
 static void BM_RegisterValidPathsDerivations(benchmark::State & state)
 {
@@ -75,5 +74,7 @@ static void BM_RegisterValidPathsDerivations(benchmark::State & state)
 }
 
 BENCHMARK(BM_RegisterValidPathsDerivations)->Arg(10);
+
+} // namespace nix
 
 #endif

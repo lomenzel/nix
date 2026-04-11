@@ -2,7 +2,6 @@
 #include "nix/store/store-open.hh"
 #include "nix/store/realisation.hh"
 #include "nix/store/make-content-addressed.hh"
-#include "nix/util/url.hh"
 #include "nix/util/environment-variables.hh"
 
 namespace nix {
@@ -291,7 +290,7 @@ static RegisterPrimOp primop_fetchClosure({
       However, `fetchClosure` is more reproducible because it specifies a binary cache from which the path can be fetched.
       Also, using content-addressed store paths does not require users to configure [`trusted-public-keys`](@docroot@/command-ref/conf-file.md#conf-trusted-public-keys) to ensure their authenticity.
     )",
-    .fun = prim_fetchClosure,
+    .impl = prim_fetchClosure,
     .experimentalFeature = Xp::FetchClosure,
 });
 

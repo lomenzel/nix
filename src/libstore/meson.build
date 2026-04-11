@@ -79,6 +79,11 @@ foreach funcspec : check_funcs
   configdata_priv.set(define_name, define_value)
 endforeach
 
+if host_machine.system() == 'linux'
+  has_landlock = cxx.has_header('linux/landlock.h')
+  configdata_priv.set('HAVE_LANDLOCK', has_landlock.to_int())
+endif
+
 has_acl_support = cxx.has_header('sys/xattr.h') \
   and cxx.has_function('llistxattr') \
   and cxx.has_function('lremovexattr')
@@ -115,17 +120,10 @@ boost = dependency(
 # put in `deps_other`.
 deps_other += boost
 
-curl = dependency('libcurl', 'curl', version : '>= 7.75.0')
-if curl.version().version_compare('>=8.16.0') and curl.version().version_compare(
-  '<8.17.0',
-)
-  # Out of precaution, avoid building with libcurl version that suffer from https://github.com/curl/curl/issues/19334.
-  error(
-    'curl @0@ has issues with write pausing, please use libcurl < 8.16 or >= 8.17, see https://github.com/curl/curl/issues/19334'.format(
-      curl.version(),
-    ),
-  )
-endif
+# This is quite new, but curl has a bunch of known issues with write pausing and decompression.
+# Please use libcurl >= 8.17. See https://github.com/curl/curl/issues/19334, https://github.com/curl/curl/issues/16280, https://github.com/curl/curl/issues/16955 if in doubt.
+# Patch out this check at your own risk.
+curl = dependency('libcurl', 'curl', version : '>= 8.17.0')
 
 deps_private += curl
 
@@ -148,6 +146,12 @@ if is_linux and not seccomp.found()
 endif
 configdata_priv.set('HAVE_SECCOMP', seccomp.found().to_int())
 deps_private += seccomp
+
+if host_machine.system() == 'freebsd'
+  # libjail is not in freebsd.libc, but there's no discovery mechanism
+  libjail = declare_dependency(link_args : [ '-ljail' ])
+  deps_other += libjail
+endif
 
 nlohmann_json = dependency('nlohmann_json', version : '>= 3.9')
 deps_public += nlohmann_json
@@ -250,14 +254,14 @@ endif
 # by joining it with prefix, unless it was already an absolute path
 # (which is the default for store-dir, localstatedir, and log-dir).
 configdata_priv.set_quoted('NIX_STORE_DIR', store_dir)
-configdata_priv.set_quoted('NIX_STATE_DIR', localstatedir / 'nix')
-configdata_priv.set_quoted('NIX_LOG_DIR', log_dir)
-# On Windows, NIX_CONF_DIR is determined at runtime using the Windows known
-# folders API (FOLDERID_ProgramData), so we don't define it at compile time.
+# On Windows, NIX_STATE_DIR, NIX_LOG_DIR, and NIX_CONF_DIR are determined at
+# runtime using the Windows known folders API (FOLDERID_ProgramData), so we
+# don't define them at compile time.
 if host_machine.system() != 'windows'
+  configdata_priv.set_quoted('NIX_STATE_DIR', localstatedir / 'nix')
+  configdata_priv.set_quoted('NIX_LOG_DIR', log_dir)
   configdata_priv.set_quoted('NIX_CONF_DIR', sysconfdir / 'nix')
 endif
-configdata_priv.set_quoted('NIX_MAN_DIR', mandir)
 
 lsof = find_program('lsof', required : false)
 configdata_priv.set_quoted(
@@ -324,6 +328,7 @@ sources = files(
   'nar-info-disk-cache.cc',
   'nar-info.cc',
   'optimise-store.cc',
+  'outputs-query.cc',
   'outputs-spec.cc',
   'parsed-derivations.cc',
   'path-info.cc',

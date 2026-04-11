@@ -1,6 +1,6 @@
-#include <regex>
-
-#include <exception> // Needed by rapidcheck on Darwin
+#ifdef __APPLE__
+#  include <exception> // Needed by rapidcheck on Darwin
+#endif
 #include <rapidcheck.h>
 
 #include "nix/util/hash.hh"
@@ -8,6 +8,7 @@
 #include "nix/util/tests/hash.hh"
 
 namespace rc {
+
 using namespace nix;
 
 Gen<Hash> Arbitrary<Hash>::arbitrary()

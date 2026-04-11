@@ -10,7 +10,6 @@
 #include <cinttypes>
 #include <iostream>
 #include <optional>
-#include "nix/util/serialise.hh"
 #include <sstream>
 
 namespace nix {
@@ -27,18 +26,25 @@ void throwExceptionSelfCheck()
         "C++ exception handling is broken. This would appear to be a problem with the way Nix was compiled and/or linked and/or loaded.");
 }
 
+void BaseError::recalcWhat() const
+{
+    std::ostringstream oss;
+    showErrorInfo(oss, err, loggerSettings.showTrace);
+    what_ = oss.str();
+}
+
 // c++ std::exception descendants must have a 'const char* what()' function.
 // This stringifies the error and caches it for use by what(), or similarly by msg().
 const std::string & BaseError::calcWhat() const
 {
-    if (what_.has_value())
-        return *what_;
-    else {
-        std::ostringstream oss;
-        showErrorInfo(oss, err, loggerSettings.showTrace);
-        what_ = oss.str();
-        return *what_;
-    }
+    if (!what_.has_value())
+        recalcWhat();
+    return *what_;
+}
+
+bool BaseError::hasPos() const
+{
+    return err.pos.get() && *err.pos.get();
 }
 
 std::optional<std::string> ErrorInfo::programName = std::nullopt;
@@ -422,13 +428,20 @@ std::ostream & showErrorInfo(std::ostream & out, const ErrorInfo & einfo, bool s
  */
 static void writeErr(std::string_view buf)
 {
+    Descriptor fd = getStandardError();
     while (!buf.empty()) {
-        auto n = write(STDERR_FILENO, buf.data(), buf.size());
+#ifdef _WIN32
+        DWORD n;
+        if (!WriteFile(fd, buf.data(), buf.size(), &n, NULL))
+            abort();
+#else
+        auto n = ::write(fd, buf.data(), buf.size());
         if (n < 0) {
             if (errno == EINTR)
                 continue;
             abort();
         }
+#endif
         buf = buf.substr(n);
     }
 }
@@ -456,23 +469,31 @@ void unreachable(std::source_location loc)
     panic(std::string_view(buf, std::min(static_cast<int>(sizeof(buf)), n)));
 }
 
-int handleExceptions(const std::string & programName, std::function<void()> fun)
+int handleExceptions(const std::string & programName, fun<void()> body)
 {
     ReceiveInterrupts receiveInterrupts; // FIXME: need better place for this
 
     ErrorInfo::programName = baseNameOf(programName);
 
+    auto doLog = [&](BaseError & e) {
+        try {
+            logError(e.info());
+        } catch (...) {
+            printError(ANSI_RED "error:" ANSI_NORMAL " Exception while printing an exception.");
+        }
+    };
+
     std::string error = ANSI_RED "error:" ANSI_NORMAL " ";
     try {
-        fun();
+        body();
     } catch (Exit & e) {
         return e.status;
     } catch (UsageError & e) {
-        logError(e.info());
+        doLog(e);
         printError("Try '%1% --help' for more information.", programName);
         return 1;
     } catch (BaseError & e) {
-        logError(e.info());
+        doLog(e);
         return e.info().status;
     } catch (std::bad_alloc & e) {
         printError(error + "out of memory");

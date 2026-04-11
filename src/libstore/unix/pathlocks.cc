@@ -1,7 +1,5 @@
 #include "nix/store/pathlocks.hh"
-#include "nix/util/file-system.hh"
-#include "nix/util/util.hh"
-#include "nix/util/sync.hh"
+#include "nix/util/file-system-at.hh"
 #include "nix/util/signals.hh"
 
 #include <cerrno>
@@ -31,9 +29,9 @@ void deleteLockFile(const std::filesystem::path & path, Descriptor desc)
        races.  Write a (meaningless) token to the file to indicate to
        other processes waiting on this lock that the lock is stale
        (deleted). */
-    unlink(path.c_str());
+    tryUnlink(path);
     writeFull(desc, "d");
-    /* Note that the result of unlink() is ignored; removing the lock
+    /* We just try to unlink don't care if it fails; removing the lock
        file is an optimisation, not a necessity. */
 }
 
@@ -82,7 +80,8 @@ bool PathLocks::lockPaths(const std::set<std::filesystem::path> & paths, const s
        preventing deadlocks. */
     for (auto & path : paths) {
         checkInterrupt();
-        std::filesystem::path lockPath = path + ".lock";
+        auto lockPath = path;
+        lockPath += ".lock";
 
         debug("locking path %1%", PathFmt(path));
 

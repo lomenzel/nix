@@ -1,13 +1,12 @@
 #include "nix/cmd/command.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/archive.hh"
-#include "nix/util/nar-accessor.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/source-accessor.hh"
 
 #include <nlohmann/json.hpp>
 
-using namespace nix;
+namespace nix {
 
 struct MixCat : virtual Args
 {
@@ -48,7 +47,7 @@ struct CmdCatStore : StoreCommand, MixCat
     void run(ref<Store> store) override
     {
         auto [storePath, rest] = store->toStorePath(path);
-        cat(store->requireStoreObjectAccessor(storePath), CanonPath{rest});
+        cat(store->requireStoreObjectAccessor(storePath), rest);
     }
 };
 
@@ -78,7 +77,7 @@ struct CmdCatNar : StoreCommand, MixCat
 
     void run(ref<Store> store) override
     {
-        AutoCloseFD fd = openFileReadonly(narPath);
+        auto fd = openFileReadonly(narPath);
         if (!fd)
             throw NativeSysError("opening NAR file %s", PathFmt(narPath));
         auto source = FdSource{fd.get()};
@@ -88,7 +87,7 @@ struct CmdCatNar : StoreCommand, MixCat
             CanonPath neededPath = CanonPath::root;
             bool found = false;
 
-            void createRegularFile(const CanonPath & path, std::function<void(CreateRegularFileSink &)> crf) override
+            void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> crf) override
             {
                 struct : CreateRegularFileSink, FdSink
                 {
@@ -121,3 +120,5 @@ struct CmdCatNar : StoreCommand, MixCat
 
 static auto rCmdCatStore = registerCommand2<CmdCatStore>({"store", "cat"});
 static auto rCmdCatNar = registerCommand2<CmdCatNar>({"nar", "cat"});
+
+} // namespace nix

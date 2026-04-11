@@ -4,6 +4,7 @@
 #  include "nix/store/build/hook-instance.hh"
 #  include "nix/store/build/derivation-builder.hh"
 #endif
+#include "nix/util/fun.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/config-global.hh"
@@ -13,10 +14,10 @@
 #include "nix/store/common-protocol.hh"
 #include "nix/store/common-protocol-impl.hh"
 #include "nix/store/local-store.hh" // TODO remove, along with remaining downcasts
+#include "nix/store/outputs-query.hh"
 #include "nix/store/globals.hh"
 
 #include <algorithm>
-#include <fstream>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -28,10 +29,10 @@
 namespace nix {
 
 DerivationBuildingGoal::DerivationBuildingGoal(
-    const StorePath & drvPath, const Derivation & drv, Worker & worker, BuildMode buildMode, bool storeDerivation)
+    const StorePath & drvPath, ref<const Derivation> drv, Worker & worker, BuildMode buildMode, bool storeDerivation)
     : Goal(worker, gaveUpOnSubstitution(storeDerivation))
     , drvPath(drvPath)
-    , drv{std::make_unique<Derivation>(drv)}
+    , drv{std::move(drv)}
     , buildMode(buildMode)
 {
     name = fmt("building derivation '%s'", worker.store.printStorePath(drvPath));
@@ -142,7 +143,7 @@ Goal::Co DerivationBuildingGoal::gaveUpOnSubstitution(bool storeDerivation)
                 auto outMap = [&] {
                     for (auto * drvStore : {&worker.evalStore, &worker.store})
                         if (drvStore->isValidPath(depDrvPath))
-                            return worker.store.queryDerivationOutputMap(depDrvPath, drvStore);
+                            return deepQueryDerivationOutputMap(worker.store, depDrvPath, drvStore);
                     assert(false);
                 }();
 
@@ -163,7 +164,9 @@ Goal::Co DerivationBuildingGoal::gaveUpOnSubstitution(bool storeDerivation)
     /* Second, the input sources. */
     worker.store.computeFSClosure(drv->inputSrcs, inputPaths);
 
-    debug("added input paths %s", worker.store.showPaths(inputPaths));
+    debug("added input paths %s", concatMapStringsSep(", ", inputPaths, [&](auto & p) {
+              return "'" + worker.store.printStorePath(p) + "'";
+          }));
 
     /* Okay, try to build.  Note that here we don't wait for a build
        slot to become available, since we don't need one if there is a
@@ -301,9 +304,8 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
        given this information by the downstream goal, that cannot happen
        anymore if the downstream goal only cares about one output, but
        we care about all outputs. */
-    auto outputHashes = staticOutputHashes(worker.evalStore, *drv);
-    for (auto & [outputName, outputHash] : outputHashes) {
-        InitialOutput v{.outputHash = outputHash};
+    for (auto & [outputName, _] : drv->outputs) {
+        InitialOutput v;
 
         /* TODO we might want to also allow randomizing the paths
            for regular CA derivations, e.g. for sake of checking
@@ -387,14 +389,21 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
             for (auto & i : drv->outputsAndOptPaths(worker.store)) {
                 if (i.second.second)
                     lockFiles.insert(localStore->toRealPath(*i.second.second));
-                else
-                    lockFiles.insert(localStore->toRealPath(drvPath) + "." + i.first);
+                else {
+                    auto lockPath = localStore->toRealPath(drvPath);
+                    lockPath += "." + i.first;
+                    lockFiles.insert(std::move(lockPath));
+                }
             }
         }
 
         if (!outputLocks.lockPaths(lockFiles, "", false)) {
             Activity act(
-                *logger, lvlWarn, actBuildWaiting, fmt("waiting for lock on %s", Magenta(showPaths(lockFiles))));
+                *logger,
+                lvlWarn,
+                actBuildWaiting,
+                fmt("waiting for lock on %s",
+                    Magenta(concatMapStringsSep(", ", lockFiles, [](auto & p) { return "'" + p.string() + "'"; }))));
 
             /* Wait then try locking again, repeat until success (returned
                boolean is true). */
@@ -613,7 +622,7 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
     fds.insert(hook->builderOut.readSide.get());
     worker.childStarted(shared_from_this(), fds, false, false);
 
-    buildResult.startTime = time(0); // inexact
+    buildResult.startTime = time(nullptr); // inexact
 
     auto msg =
         fmt(buildMode == bmRepair  ? "repairing outputs of '%s'"
@@ -706,7 +715,7 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
     debug("build hook for '%s' finished", worker.store.printStorePath(drvPath));
 
     buildResult.timesBuilt++;
-    buildResult.stopTime = time(0);
+    buildResult.stopTime = time(nullptr);
 
     /* So the child is gone now. */
     worker.childTerminated(this);
@@ -822,13 +831,11 @@ Goal::Co DerivationBuildingGoal::buildLocally(
             struct DerivationBuildingGoalCallbacks : DerivationBuilderCallbacks
             {
                 DerivationBuildingGoal & goal;
-                std::function<void()> openLogFileFn;
-                std::function<void()> closeLogFileFn;
+                fun<void()> openLogFileFn;
+                fun<void()> closeLogFileFn;
 
                 DerivationBuildingGoalCallbacks(
-                    DerivationBuildingGoal & goal,
-                    std::function<void()> openLogFileFn,
-                    std::function<void()> closeLogFileFn)
+                    DerivationBuildingGoal & goal, fun<void()> openLogFileFn, fun<void()> closeLogFileFn)
                     : goal{goal}
                     , openLogFileFn{std::move(openLogFileFn)}
                     , closeLogFileFn{std::move(closeLogFileFn)}
@@ -1061,7 +1068,7 @@ static void runPostBuildHook(
     LogSink sink(act);
 
     runProgram2({
-        .program = workerSettings.postBuildHook,
+        .program = workerSettings.postBuildHook.get(),
         .environment = hookEnvironment,
         .standardOut = &sink,
         .mergeStderrToStdout = true,
@@ -1178,15 +1185,10 @@ LogFile::LogFile(Store & store, const StorePath & drvPath, const LogFileSettings
 
     auto baseName = std::string(baseNameOf(store.printStorePath(drvPath)));
 
-    Path logDir;
-    if (auto localStore = dynamic_cast<LocalStore *>(&store))
-        logDir = localStore->config->logDir;
-    else
-        logDir = logSettings.nixLogDir.string();
-    Path dir = fmt("%s/%s/%s/", logDir, LocalFSStore::drvsLogDir, baseName.substr(0, 2));
+    auto dir = store.config.getLogDir() / LocalFSStore::drvsLogDir / baseName.substr(0, 2);
     createDirs(dir);
 
-    Path logFileName = fmt("%s/%s%s", dir, baseName.substr(2), logSettings.compressLog ? ".bz2" : "");
+    auto logFileName = dir / (baseName.substr(2) + (logSettings.compressLog ? ".bz2" : ""));
 
     fd = openNewFileForWrite(
         logFileName,
@@ -1196,7 +1198,7 @@ LogFile::LogFile(Store & store, const StorePath & drvPath, const LogFileSettings
             .followSymlinksOnTruncate = true, /* FIXME: Probably shouldn't follow symlinks. */
         });
     if (!fd)
-        throw SysError("creating log file '%1%'", logFileName);
+        throw SysError("creating log file %1%", PathFmt(logFileName));
 
     fileSink = std::make_shared<FdSink>(fd.get());
 
@@ -1268,12 +1270,12 @@ DerivationBuildingGoal::checkPathValidity(std::map<std::string, InitialOutput> &
                                                                               : PathStatus::Corrupt,
             };
         }
-        auto drvOutput = DrvOutput{info.outputHash, i.first};
+        auto drvOutput = DrvOutput{drvPath, i.first};
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
             if (auto real = worker.store.queryRealisation(drvOutput)) {
                 info.known = {
                     .path = real->outPath,
-                    .status = PathStatus::Valid,
+                    .status = worker.store.isValidPath(real->outPath) ? PathStatus::Valid : PathStatus::Absent,
                 };
             } else if (info.known && info.known->isValid()) {
                 // We know the output because it's a static output of the

@@ -1,25 +1,13 @@
-#include "nix/util/archive.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/local-fs-store.hh"
-#include "nix/store/globals.hh"
 #include "nix/util/compression.hh"
 #include "nix/store/derivations.hh"
 
 namespace nix {
 
-Path LocalFSStoreConfig::getDefaultStateDir()
-{
-    return settings.nixStateDir.string();
-}
-
-Path LocalFSStoreConfig::getDefaultLogDir()
-{
-    return settings.getLogFileSettings().nixLogDir.string();
-}
-
-LocalFSStoreConfig::LocalFSStoreConfig(PathView rootDir, const Params & params)
-    : StoreConfig(params)
+LocalFSStoreConfig::LocalFSStoreConfig(const std::filesystem::path & rootDir, const Params & params)
+    : StoreConfig(params, FilePathType::Native)
     /* Default `?root` from `rootDir` if non set
      * NOTE: We would like to just do rootDir.set(...), which would take care of
      * all normalization and error checking for us. Unfortunately we cannot do
@@ -29,8 +17,7 @@ LocalFSStoreConfig::LocalFSStoreConfig(PathView rootDir, const Params & params)
      * manually repeat the same normalization logic.
      */
     , rootDir{makeRootDirSetting(
-          *this,
-          !rootDir.empty() && params.count("root") == 0 ? std::optional<Path>{canonPath(rootDir)} : std::nullopt)}
+          *this, !rootDir.empty() && params.count("root") == 0 ? std::optional{canonPath(rootDir)} : std::nullopt)}
 {
 }
 
@@ -76,7 +63,7 @@ struct LocalStoreAccessor : PosixSourceAccessor
         return PosixSourceAccessor::readDirectory(path);
     }
 
-    void readFile(const CanonPath & path, Sink & sink, std::function<void(uint64_t)> sizeCallback) override
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
         requireStoreObject(path);
         return PosixSourceAccessor::readFile(path, sink, sizeCallback);
@@ -112,7 +99,7 @@ std::shared_ptr<SourceAccessor> LocalFSStore::getFSAccessor(const StorePath & pa
     return std::make_shared<PosixSourceAccessor>(std::move(absPath));
 }
 
-const std::string LocalFSStore::drvsLogDir = "drvs";
+const std::filesystem::path LocalFSStore::drvsLogDir = "drvs";
 
 std::optional<std::string> LocalFSStore::getBuildLogExact(const StorePath & path)
 {
@@ -120,10 +107,10 @@ std::optional<std::string> LocalFSStore::getBuildLogExact(const StorePath & path
 
     for (int j = 0; j < 2; j++) {
 
-        Path logPath =
-            j == 0 ? fmt("%s/%s/%s/%s", config.logDir.get(), drvsLogDir, baseName.substr(0, 2), baseName.substr(2))
-                   : fmt("%s/%s/%s", config.logDir.get(), drvsLogDir, baseName);
-        Path logBz2Path = logPath + ".bz2";
+        auto logPath = config.logDir.get()
+                       / (j == 0 ? drvsLogDir / baseName.substr(0, 2) / baseName.substr(2) : drvsLogDir / baseName);
+        auto logBz2Path = logPath;
+        logBz2Path += ".bz2";
 
         if (pathExists(logPath))
             return readFile(logPath);

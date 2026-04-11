@@ -11,11 +11,7 @@
 #include "nix/util/executable-path.hh"
 #include "nix/store/globals.hh"
 
-namespace nix::fs {
-using namespace std::filesystem;
-}
-
-using namespace nix;
+namespace nix {
 
 namespace {
 
@@ -182,3 +178,5 @@ struct CmdConfigCheck : StoreCommand
 };
 
 static auto rCmdConfigCheck = registerCommand2<CmdConfigCheck>({"config", "check"});
+
+} // namespace nix

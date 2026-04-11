@@ -35,7 +35,7 @@ PeerInfo getPeerInfo(Descriptor remote);
  * @param closeListeners A callback to close the listening sockets.
  *   Useful in forked child processes to release the bound sockets.
  */
-using UnixSocketHandler = std::function<void(AutoCloseFD socket, std::function<void()> closeListeners)>;
+using UnixSocketHandler = fun<void(AutoCloseFD socket, std::function<void()> closeListeners)>;
 
 /**
  * Options for the serve loop.
@@ -53,6 +53,19 @@ struct ServeUnixSocketOptions
      * Mode for the created socket file.
      */
     mode_t socketMode = 0666;
+
+#ifndef _WIN32
+    /**
+     * Additional file descriptor to poll. Useful for doing a self-pipe trick
+     * https://cr.yp.to/docs/selfpipe.html.
+     */
+    Descriptor auxiliaryFd = INVALID_DESCRIPTOR;
+
+    /**
+     * Optional callback invoked on POLLIN event for auxiliaryFd.
+     */
+    std::function<void()> onAuxiliaryFdPollin = nullptr;
+#endif
 };
 
 /**

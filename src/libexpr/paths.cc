@@ -10,9 +10,11 @@ SourcePath EvalState::rootPath(CanonPath path)
     return {rootFS, std::move(path)};
 }
 
-SourcePath EvalState::rootPath(PathView path)
+SourcePath EvalState::rootPath(std::string_view path)
 {
-    return {rootFS, CanonPath(absPath(path))};
+    /* FIXME: Move this out of EvalState, since it's using native
+       std::filesystem::path and current working directory. */
+    return {rootFS, CanonPath(absPath(path).string())};
 }
 
 SourcePath EvalState::storePath(const StorePath & path)

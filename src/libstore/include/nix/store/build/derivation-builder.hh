@@ -20,14 +20,14 @@ namespace nix {
  * Denotes a build failure that stemmed from the builder exiting with a
  * failing exist status.
  */
-struct BuilderFailureError : BuildError
+struct BuilderFailureError final : CloneableError<BuilderFailureError, BuildError>
 {
     int builderStatus;
 
     std::string extraMsgAfter;
 
     BuilderFailureError(BuildResult::Failure::Status status, int builderStatus, std::string extraMsgAfter)
-        : BuildError{
+        : CloneableError{
             status,
               /* No message for now, because the caller will make for
                  us, with extra context */
@@ -47,6 +47,9 @@ struct ChrootPath
     std::filesystem::path source;
     bool optional = false;
 };
+
+void to_json(nlohmann::json & j, const ChrootPath & cp);
+void from_json(const nlohmann::json & j, ChrootPath & cp);
 
 typedef std::map<std::filesystem::path, ChrootPath> PathsInChroot; // maps target path to source path
 
@@ -194,7 +197,7 @@ struct DerivationBuilder : RestrictionContext
  * @see man PR_SET_PDEATHSIG
  * @see https://github.com/golang/go/issues/9686
  */
-void preserveDeathSignal(std::function<void()> fn);
+void preserveDeathSignal(fun<void()> setCredentials);
 
 struct ExternalBuilder
 {

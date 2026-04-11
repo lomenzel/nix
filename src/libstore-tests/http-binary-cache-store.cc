@@ -3,28 +3,45 @@
 
 #include "nix/store/http-binary-cache-store.hh"
 #include "nix/store/tests/https-store.hh"
-#include "nix/util/fs-sink.hh"
 
 namespace nix {
 
+using Authority = ParsedURL::Authority;
+
+TEST(HttpBinaryCacheStore, storeDir_absolutePath)
+{
+    HttpBinaryCacheStoreConfig config{parseURL("https://example.com"), {{"store", "/my/store"}}};
+    EXPECT_EQ(config.storeDir, "/my/store");
+}
+
+TEST(HttpBinaryCacheStore, storeDir_relativePath_rejected)
+{
+    EXPECT_THROW(HttpBinaryCacheStoreConfig(parseURL("https://example.com"), {{"store", "my/store"}}), UsageError);
+}
+
 TEST(HttpBinaryCacheStore, constructConfig)
 {
-    HttpBinaryCacheStoreConfig config{"http", "foo.bar.baz", {}};
+    HttpBinaryCacheStoreConfig config{
+        {
+            .scheme = "http",
+            .authority = Authority{.host = "foo.bar.baz"},
+        },
+        {},
+    };
 
     EXPECT_EQ(config.cacheUri.to_string(), "http://foo.bar.baz");
 }
 
 TEST(HttpBinaryCacheStore, constructConfigNoTrailingSlash)
 {
-    HttpBinaryCacheStoreConfig config{"https", "foo.bar.baz/a/b/", {}};
-
+    HttpBinaryCacheStoreConfig config{parseURL("https://foo.bar.baz/a/b/"), {}};
     EXPECT_EQ(config.cacheUri.to_string(), "https://foo.bar.baz/a/b");
 }
 
 TEST(HttpBinaryCacheStore, constructConfigWithParams)
 {
     StoreConfig::Params params{{"compression", "xz"}};
-    HttpBinaryCacheStoreConfig config{"https", "foo.bar.baz/a/b/", params};
+    HttpBinaryCacheStoreConfig config{parseURL("https://foo.bar.baz/a/b/"), params};
     EXPECT_EQ(config.cacheUri.to_string(), "https://foo.bar.baz/a/b");
     EXPECT_EQ(config.getReference().params, params);
 }
@@ -32,7 +49,7 @@ TEST(HttpBinaryCacheStore, constructConfigWithParams)
 TEST(HttpBinaryCacheStore, constructConfigWithParamsAndUrlWithParams)
 {
     StoreConfig::Params params{{"compression", "xz"}};
-    HttpBinaryCacheStoreConfig config{"https", "foo.bar.baz/a/b?some-param=some-value", params};
+    HttpBinaryCacheStoreConfig config{parseURL("https://foo.bar.baz/a/b?some-param=some-value"), params};
     EXPECT_EQ(config.cacheUri.to_string(), "https://foo.bar.baz/a/b?some-param=some-value");
     EXPECT_EQ(config.getReference().params, params);
 }

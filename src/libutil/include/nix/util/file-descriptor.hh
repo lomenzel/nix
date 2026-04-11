@@ -65,7 +65,7 @@ std::string readFile(Descriptor fd);
  * Platform-specific read into a buffer.
  *
  * Thin wrapper around ::read (Unix) or ReadFile (Windows).
- * Does NOT handle EINTR on Unix - caller must catch and retry if needed.
+ * Handles EINTR on Unix. Treats ERROR_BROKEN_PIPE as EOF on Windows.
  *
  * @param fd The file descriptor to read from
  * @param buffer The buffer to read into
@@ -73,6 +73,19 @@ std::string readFile(Descriptor fd);
  * @throws SystemError on failure
  */
 size_t read(Descriptor fd, std::span<std::byte> buffer);
+
+/**
+ * Platform-specific write from a buffer.
+ *
+ * Thin wrapper around ::write (Unix) or WriteFile (Windows).
+ * Handles EINTR on Unix.
+ *
+ * @param fd The file descriptor to write to
+ * @param buffer The buffer to write from
+ * @return The number of bytes actually written
+ * @throws SystemError on failure
+ */
+size_t write(Descriptor fd, std::span<const std::byte> buffer, bool allowInterrupts);
 
 /**
  * Get the size of a file.
@@ -272,11 +285,25 @@ public:
     void startFsync() const;
 };
 
+/**
+ * Duplicate a file descriptor.
+ *
+ * Returns a new file descriptor that refers to the same open file
+ * description as the original.
+ */
+AutoCloseFD dupDescriptor(Descriptor fd);
+
 class Pipe
 {
 public:
     AutoCloseFD readSide, writeSide;
-    void create();
+
+    void create(
+#ifndef _WIN32
+        bool nonBlocking = false
+#endif
+    );
+
     void close();
 };
 
@@ -293,6 +320,27 @@ void closeExtraFDs();
  * Set the close-on-exec flag for the given file descriptor.
  */
 void closeOnExec(Descriptor fd);
+
+/**
+ * A useful primitive for asynchronous poll() loops to notify about some work
+ * completing that gets polled alongside other file descriptors.
+ */
+struct SelfPipe
+{
+    Pipe pipe;
+
+    void create();
+
+    /**
+     * Write some data to the pipe in a non-blocking manner.
+     */
+    void notify();
+
+    /**
+     * Drain all data from the pipe.
+     */
+    void drain();
+};
 
 } // namespace unix
 #endif

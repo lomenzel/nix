@@ -22,7 +22,6 @@
 #include "nix/expr/eval-cache.hh"
 #include "nix/flake/flake.hh"
 #include "nix/flake/settings.hh"
-#include "nix/util/json-utils.hh"
 
 #include "self-exe.hh"
 #include "crash-handler.hh"
@@ -42,15 +41,15 @@
 #  include "nix/util/linux-namespaces.hh"
 #endif
 
+#include "nix/util/strings.hh"
+
+namespace nix {
+
 #ifndef _WIN32
 extern std::string chrootHelperName;
 
 void chrootHelper(int argc, char ** argv);
 #endif
-
-#include "nix/util/strings.hh"
-
-namespace nix {
 
 /* Check if we have a non-loopback/link-local network interface. */
 static bool haveInternet()
@@ -404,6 +403,7 @@ void mainWrapped(int argc, char ** argv)
             if (unshare(CLONE_NEWNS) == -1)
                 throw SysError("setting up a private mount namespace");
         } catch (Error & e) {
+            warn("failed to set up a private mount namespace: %s", e.msg());
         }
     }
 #endif
@@ -421,9 +421,8 @@ void mainWrapped(int argc, char ** argv)
     }
 
     {
-        auto legacy = RegisterLegacyCommand::commands()[programName];
-        if (legacy)
-            return legacy(argc, argv);
+        if (auto legacy = get(RegisterLegacyCommand::commands(), programName))
+            return (*legacy)(argc, argv);
     }
 
     evalSettings.pureEval = true;

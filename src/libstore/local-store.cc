@@ -56,9 +56,9 @@
 
 namespace nix {
 
-LocalStoreConfig::LocalStoreConfig(std::string_view scheme, std::string_view authority, const Params & params)
-    : StoreConfig(params)
-    , LocalFSStoreConfig(authority, params)
+LocalStoreConfig::LocalStoreConfig(const std::filesystem::path & path, const Params & params)
+    : StoreConfig(params, FilePathType::Native)
+    , LocalFSStoreConfig(path, params)
 {
 }
 
@@ -80,7 +80,7 @@ std::filesystem::path LocalBuildStoreConfig::getBuildDir() const
     auto & bd = getLocalSettings().buildDir.get();
     return bd.has_value()               ? *bd
            : buildDir.get().has_value() ? *buildDir.get()
-                                        : std::filesystem::path{stateDir.get()} / "builds";
+                                        : AbsolutePath{stateDir.get() / "builds"};
 }
 
 ref<Store> LocalStore::Config::openStore() const
@@ -109,7 +109,6 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryValidDerivers;
     SQLiteStmt QueryDerivationOutputs;
     SQLiteStmt QueryRealisedOutput;
-    SQLiteStmt QueryAllRealisedOutputs;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
 };
@@ -119,12 +118,12 @@ LocalStore::LocalStore(ref<const Config> config)
     , LocalFSStore{*config}
     , config{config}
     , _state(make_ref<Sync<State>>())
-    , dbDir(config->stateDir + "/db")
-    , linksDir(config->realStoreDir + "/.links")
-    , reservedPath(dbDir + "/reserved")
-    , schemaPath(dbDir + "/schema")
-    , tempRootsDir(config->stateDir + "/temproots")
-    , fnTempRoots(fmt("%s/%d", tempRootsDir, getpid()))
+    , dbDir(config->stateDir.get() / "db")
+    , linksDir(config->realStoreDir.get() / ".links")
+    , reservedPath(dbDir / "reserved")
+    , schemaPath(dbDir / "schema")
+    , tempRootsDir(config->stateDir.get() / "temproots")
+    , fnTempRoots(tempRootsDir / std::to_string(getpid()))
 {
     auto state(_state->lock());
     state->stmts = std::make_unique<State::Stmts>();
@@ -137,16 +136,16 @@ LocalStore::LocalStore(ref<const Config> config)
         makeStoreWritable();
     }
     createDirs(linksDir);
-    Path profilesDir = config->stateDir + "/profiles";
+    auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
     createDirs(tempRootsDir);
     createDirs(dbDir);
-    Path gcRootsDir = config->stateDir + "/gcroots";
+    auto gcRootsDir = config->stateDir.get() / "gcroots";
     const auto & localSettings = config->getLocalSettings();
     const auto & gcSettings = localSettings.getGCSettings();
     createDirs(gcRootsDir);
 
-    for (auto & perUserDir : {profilesDir + "/per-user", gcRootsDir + "/per-user"}) {
+    for (auto & perUserDir : {profilesDir / "per-user", gcRootsDir / "per-user"}) {
         createDirs(perUserDir);
         if (!config->readOnly) {
             // Skip chmod call if the directory already has the correct permissions (0755).
@@ -171,8 +170,7 @@ LocalStore::LocalStore(ref<const Config> config)
             auto st = stat(config->realStoreDir.get());
 
             if (st.st_uid != 0 || st.st_gid != gr->gr_gid || (st.st_mode & ~S_IFMT) != perm) {
-                if (chown(config->realStoreDir.get().c_str(), 0, gr->gr_gid) == -1)
-                    throw SysError("changing ownership of path '%1%'", config->realStoreDir);
+                chown(config->realStoreDir.get(), 0, gr->gr_gid);
                 chmod(config->realStoreDir.get(), perm);
             }
         }
@@ -201,7 +199,7 @@ LocalStore::LocalStore(ref<const Config> config)
         auto st = maybeStat(reservedPath);
         if (!st || st->st_size != gcSettings.reservedSize) {
             AutoCloseFD fd = toDescriptor(open(
-                reservedPath.c_str(),
+                reservedPath.string().c_str(),
                 O_WRONLY | O_CREAT
 #ifndef _WIN32
                     | O_CLOEXEC
@@ -230,9 +228,9 @@ LocalStore::LocalStore(ref<const Config> config)
     /* Acquire the big fat lock in shared mode to make sure that no
        schema upgrade is in progress. */
     if (!config->readOnly) {
-        Path globalLockPath = dbDir + "/big-lock";
+        auto globalLockPath = dbDir / "big-lock";
         try {
-            globalLock = openLockFile(globalLockPath.c_str(), true);
+            globalLock = openLockFile(globalLockPath, true);
         } catch (SystemError & e) {
             if (e.is(std::errc::permission_denied) || e.is(std::errc::operation_not_permitted)) {
                 e.addTrace(
@@ -357,14 +355,14 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->RegisterRealisedOutput.create(
             state->db,
             R"(
-                insert into Realisations (drvPath, outputName, outputPath, signatures)
-                values (?, ?, (select id from ValidPaths where path = ?), ?)
+                insert into BuildTraceV3 (drvPath, outputName, outputPath, signatures)
+                values (?, ?, ?, ?)
                 ;
             )");
         state->stmts->UpdateRealisedOutput.create(
             state->db,
             R"(
-                update Realisations
+                update BuildTraceV3
                     set signatures = ?
                 where
                     drvPath = ? and
@@ -374,17 +372,8 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->QueryRealisedOutput.create(
             state->db,
             R"(
-                select Realisations.id, Output.path, Realisations.signatures from Realisations
-                    inner join ValidPaths as Output on Output.id = Realisations.outputPath
+                select id, outputPath, signatures from BuildTraceV3
                     where drvPath = ? and outputName = ?
-                    ;
-            )");
-        state->stmts->QueryAllRealisedOutputs.create(
-            state->db,
-            R"(
-                select outputName, Output.path from Realisations
-                    inner join ValidPaths as Output on Output.id = Realisations.outputPath
-                    where drvPath = ?
                     ;
             )");
     }
@@ -392,9 +381,9 @@ LocalStore::LocalStore(ref<const Config> config)
 
 AutoCloseFD LocalStore::openGCLock()
 {
-    Path fnGCLock = config->stateDir + "/gc.lock";
+    auto fnGCLock = config->stateDir.get() / "gc.lock";
     auto fdGCLock = open(
-        fnGCLock.c_str(),
+        fnGCLock.string().c_str(),
         O_RDWR | O_CREAT
 #ifndef _WIN32
             | O_CLOEXEC
@@ -402,11 +391,11 @@ AutoCloseFD LocalStore::openGCLock()
         ,
         0600);
     if (!fdGCLock)
-        throw SysError("opening global GC lock '%1%'", fnGCLock);
+        throw SysError("opening global GC lock %1%", PathFmt(fnGCLock));
     return toDescriptor(fdGCLock);
 }
 
-void LocalStore::deleteStorePath(const Path & path, uint64_t & bytesFreed, bool isKnownPath)
+void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath)
 {
     try {
         deletePath(path, bytesFreed);
@@ -414,15 +403,15 @@ void LocalStore::deleteStorePath(const Path & path, uint64_t & bytesFreed, bool 
         if (config->ignoreGcDeleteFailure) {
             logWarning(
                 {.msg = HintFmt(
-                     isKnownPath ? "ignoring failure to remove store path '%1%': %2%"
-                                 : "ignoring failure to remove garbage in store directory '%1%': %2%",
-                     path,
+                     isKnownPath ? "ignoring failure to remove store path %1%: %2%"
+                                 : "ignoring failure to remove garbage in store directory %1%: %2%",
+                     PathFmt(path),
                      e.info().msg)});
         } else {
             e.addTrace(
                 {},
-                isKnownPath ? "While deleting store path '%1%'" : "While deleting garbage in store directory '%1%'",
-                path);
+                isKnownPath ? "While deleting store path %1%" : "While deleting garbage in store directory %1%",
+                PathFmt(path));
             throw;
         }
     }
@@ -447,7 +436,7 @@ LocalStore::~LocalStore()
         auto fdTempRoots(_fdTempRoots.lock());
         if (*fdTempRoots) {
             fdTempRoots->close();
-            unlink(fnTempRoots.c_str());
+            tryUnlink(fnTempRoots);
         }
     } catch (...) {
         ignoreExceptionInDestructor();
@@ -465,11 +454,13 @@ StoreReference LocalStoreConfig::getReference() const
     /* Back-compatibility kludge. Tools like nix-output-monitor expect 'local'
        and can't parse 'local://'. */
     if (params.empty())
+        /* TODO: Add the rootDir here as the authority? */
         return {.variant = StoreReference::Local{}};
     return {
         .variant =
             StoreReference::Specified{
                 .scheme = *uriSchemes().begin(),
+                /* TODO: Add the rootDir here as the authority? */
             },
         .params = std::move(params),
     };
@@ -487,7 +478,7 @@ int LocalStore::getSchema()
         auto s = readFile(schemaPath);
         auto n = string2Int<int>(s);
         if (!n)
-            throw Error("'%1%' is corrupt", schemaPath);
+            throw Error("%1% is corrupt", PathFmt(schemaPath));
         curSchema = *n;
     }
     return curSchema;
@@ -499,15 +490,15 @@ void LocalStore::openDB(State & state, bool create)
         throw Error("cannot create database while in read-only mode");
     }
 
-    if (access(dbDir.c_str(), R_OK | (config->readOnly ? 0 : W_OK)))
-        throw SysError("Nix database directory '%1%' is not writable", dbDir);
+    if (access(dbDir.string().c_str(), R_OK | (config->readOnly ? 0 : W_OK)))
+        throw SysError("Nix database directory %1% is not writable", PathFmt(dbDir));
 
     /* Open the Nix database. */
     auto & db(state.db);
     auto openMode = config->readOnly ? SQLiteOpenMode::Immutable
                     : create         ? SQLiteOpenMode::Normal
                                      : SQLiteOpenMode::NoCreate;
-    state.db = SQLite(std::filesystem::path(dbDir) / "db.sqlite", {.mode = openMode, .useWAL = settings.useSQLiteWAL});
+    state.db = SQLite(dbDir / "db.sqlite", {.mode = openMode, .useWAL = settings.useSQLiteWAL});
 
 #ifdef __CYGWIN__
     /* The cygwin version of sqlite3 has a patch which calls
@@ -601,9 +592,11 @@ void LocalStore::upgradeDBSchema(State & state)
 
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations))
         doUpgrade(
-            "20220326-ca-derivations",
+            "20251017-ca-derivations",
 #include "ca-specific-schema.sql.gen.hh"
         );
+
+    doUpgrade("20260309-drop-redundant-indexreferrer", "drop index if exists IndexReferrer");
 }
 
 /* To improve purity, users may want to make the Nix store a read-only
@@ -619,8 +612,30 @@ void LocalStore::makeStoreWritable()
         throw SysError("getting info about the Nix store mount point");
 
     if (stat.f_flag & ST_RDONLY) {
-        if (mount(0, config->realStoreDir.get().c_str(), "none", MS_REMOUNT | MS_BIND, 0) == -1)
-            throw SysError("remounting %1% writable", config->realStoreDir);
+        /* In a user namespace, mount flags like `nodev` and `nosuid` are
+           locked and dropping them causes `EPERM`, so here we translate each
+           `statvfs` flag to the corresponding `mount` flag individually. */
+        unsigned long flags = MS_REMOUNT | MS_BIND;
+        if (stat.f_flag & ST_NODEV)
+            flags |= MS_NODEV;
+        if (stat.f_flag & ST_NOSUID)
+            flags |= MS_NOSUID;
+        if (stat.f_flag & ST_NOEXEC)
+            flags |= MS_NOEXEC;
+        if (stat.f_flag & ST_NOATIME)
+            flags |= MS_NOATIME;
+        if (stat.f_flag & ST_NODIRATIME)
+            flags |= MS_NODIRATIME;
+        if (stat.f_flag & ST_RELATIME)
+            flags |= MS_RELATIME;
+        if (stat.f_flag & ST_SYNCHRONOUS)
+            flags |= MS_SYNCHRONOUS;
+#  ifdef ST_NOSYMFOLLOW
+        if (stat.f_flag & ST_NOSYMFOLLOW)
+            flags |= MS_NOSYMFOLLOW;
+#  endif
+        if (mount(0, config->realStoreDir.get().c_str(), "none", flags, 0) == -1)
+            throw SysError("remounting %s writable", PathFmt(config->realStoreDir.get()));
     }
 #endif
 }
@@ -645,8 +660,8 @@ void LocalStore::registerDrvOutput(const Realisation & info)
                 auto combinedSignatures = oldR->signatures;
                 combinedSignatures.insert(info.signatures.begin(), info.signatures.end());
                 state->stmts->UpdateRealisedOutput
-                    .use()(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))(info.id.strHash())(
-                        info.id.outputName)
+                    .use()(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))(
+                        info.id.drvPath.to_string())(info.id.outputName)
                     .exec();
             } else {
                 throw Error(
@@ -660,7 +675,7 @@ void LocalStore::registerDrvOutput(const Realisation & info)
             }
         } else {
             state->stmts->RegisterRealisedOutput
-                .use()(info.id.strHash())(info.id.outputName)(printStorePath(info.outPath))(
+                .use()(info.id.drvPath.to_string())(info.id.outputName)(printStorePath(info.outPath))(
                     concatStringsSep(" ", Signature::toStrings(info.signatures)))
                 .exec();
         }
@@ -683,7 +698,7 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
 
     state.stmts->RegisterValidPath
         .use()(printStorePath(info.path))(info.narHash.to_string(HashFormat::Base16, true))(
-            info.registrationTime == 0 ? time(0) : info.registrationTime)(
+            info.registrationTime == 0 ? time(nullptr) : info.registrationTime)(
             info.deriver ? printStorePath(*info.deriver) : "",
             (bool) info.deriver)(info.narSize, info.narSize != 0)(info.ultimate ? 1 : 0, info.ultimate)(
             concatStringsSep(" ", Signature::toStrings(info.sigs)),
@@ -874,12 +889,33 @@ LocalStore::queryStaticPartialDerivationOutputMap(const StorePath & path)
     });
 }
 
+std::optional<StorePath>
+LocalStore::queryStaticPartialDerivationOutput(const StorePath & path, const std::string & outputName)
+{
+    auto outputs = queryStaticPartialDerivationOutputMap(path);
+    auto it = outputs.find(outputName);
+    if (it == outputs.end()) {
+        /* Only throw if CA derivations is disabled, because then the
+           SQL table is complete.
+
+           With CA derivations enabled, derivations without static
+           outputs exist, this absence of a row in this table does not
+           mean the derivation doesn't have an output necessarily, just
+           that that it doesn't have an output with a known output path.
+          */
+        if (!experimentalFeatureSettings.isEnabled(Xp::CaDerivations))
+            throw Error("derivation '%s' does not have an output named '%s'", printStorePath(path), outputName);
+        return std::nullopt;
+    }
+    return it->second;
+}
+
 std::optional<StorePath> LocalStore::queryPathFromHashPart(const std::string & hashPart)
 {
     if (hashPart.size() != StorePath::HashLen)
         throw Error("invalid hash part");
 
-    Path prefix = storeDir + "/" + hashPart;
+    std::string prefix = storeDir + "/" + hashPart;
 
     return retrySQLite<std::optional<StorePath>>([&]() -> std::optional<StorePath> {
         auto state(_state->lock());
@@ -996,18 +1032,6 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
         throw Error("cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
 
     {
-        /* In case we are not interested in reading the NAR: discard it. */
-        bool narRead = false;
-        Finally cleanup = [&]() {
-            if (!narRead)
-                try {
-                    source.skip(info.narSize);
-                } catch (...) {
-                    // TODO: should Interrupted be handled here?
-                    ignoreExceptionInDestructor();
-                }
-        };
-
         addTempRoot(info.path);
 
         if (repair || !isValidPath(info.path)) {
@@ -1032,7 +1056,6 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
                 TeeSource wrapperSource{source, hashSink};
 
-                narRead = true;
                 restorePath(realPath, wrapperSource, config->getLocalSettings().fsyncStorePaths);
 
                 auto hashResult = hashSink.finish();
@@ -1281,9 +1304,10 @@ std::pair<std::filesystem::path, AutoCloseFD> LocalStore::createTempDirInStore()
     do {
         /* There is a slight possibility that `tmpDir' gets deleted by
            the GC between createTempDir() and when we acquire a lock on it.
-           We'll repeat until 'tmpDir' exists and we've locked it. */
-        tmpDirFn = createTempDir(std::filesystem::path{config->realStoreDir.get()}, "tmp");
-        tmpDirFd = openDirectory(tmpDirFn);
+           We'll repeat until 'tmpDir' exists and we've locked it.
+           Make the directory accessible only to the current user. */
+        tmpDirFn = createTempDir(std::filesystem::path{config->realStoreDir.get()}, "tmp", /*mode=*/0700);
+        tmpDirFd = openDirectory(tmpDirFn, FinalSymlink::DontFollow);
         if (!tmpDirFd) {
             continue;
         }
@@ -1305,7 +1329,9 @@ void LocalStore::invalidatePathChecked(const StorePath & path)
             referrers.erase(path); /* ignore self-references */
             if (!referrers.empty())
                 throw PathInUse(
-                    "cannot delete path '%s' because it is in use by %s", printStorePath(path), showPaths(referrers));
+                    "cannot delete path '%s' because it is in use by %s",
+                    printStorePath(path),
+                    concatMapStringsSep(", ", referrers, [&](auto & p) { return "'" + printStorePath(p) + "'"; }));
             invalidatePath(*state, path);
         }
 
@@ -1403,7 +1429,7 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                 if (isValidPath(i))
                     logError(e.info());
                 else
-                    warn(e.msg());
+                    logWarning(e.info());
                 errors = true;
             }
         }
@@ -1453,7 +1479,7 @@ LocalStore::VerificationResult LocalStore::verifyAllValidPaths(RepairFlag repair
 
 void LocalStore::verifyPath(
     const StorePath & path,
-    std::function<bool(const StorePath &)> existsInStoreDir,
+    fun<bool(const StorePath &)> existsInStoreDir,
     StorePathSet & done,
     StorePathSet & validPaths,
     RepairFlag repair,
@@ -1536,7 +1562,7 @@ void LocalStore::addSignatures(const StorePath & storePath, const std::set<Signa
 std::optional<std::pair<int64_t, UnkeyedRealisation>>
 LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & id)
 {
-    auto useQueryRealisedOutput(state.stmts->QueryRealisedOutput.use()(id.strHash())(id.outputName));
+    auto useQueryRealisedOutput(state.stmts->QueryRealisedOutput.use()(id.drvPath.to_string())(id.outputName));
     if (!useQueryRealisedOutput.next())
         return std::nullopt;
     auto realisationDbId = useQueryRealisedOutput.getInt(0);
@@ -1565,10 +1591,6 @@ void LocalStore::queryRealisationUncached(
     const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept
 {
     try {
-        if (!experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
-            callback(nullptr);
-            return;
-        }
         auto maybeRealisation = retrySQLite<std::optional<const UnkeyedRealisation>>(
             [&]() { return queryRealisation_(*_state->lock(), id); });
         if (maybeRealisation)
@@ -1587,14 +1609,16 @@ void LocalStore::addBuildLog(const StorePath & drvPath, std::string_view log)
 
     auto baseName = drvPath.to_string();
 
-    auto logPath = fmt("%s/%s/%s/%s.bz2", config->logDir, drvsLogDir, baseName.substr(0, 2), baseName.substr(2));
+    auto logPath =
+        config->logDir.get() / drvsLogDir / baseName.substr(0, 2) / (std::string(baseName.substr(2)) + ".bz2");
 
     if (pathExists(logPath))
         return;
 
-    createDirs(dirOf(logPath));
+    createDirs(logPath.parent_path());
 
-    auto tmpFile = fmt("%s.tmp.%d", logPath, getpid());
+    auto tmpFile = logPath;
+    tmpFile += ".tmp." + std::to_string(getpid());
 
     writeFile(tmpFile, compress(CompressionAlgo::bzip2, log));
 

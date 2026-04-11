@@ -2,6 +2,7 @@
 #include "nix/expr/attr-path.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/store/derivations.hh"
+#include "nix/store/outputs-query.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/globals.hh"
@@ -32,8 +33,7 @@
 #include <unistd.h>
 #include <nlohmann/json.hpp>
 
-using namespace nix;
-using std::cout;
+namespace nix {
 
 /**
  * Settings related to Nix user environments.
@@ -66,7 +66,7 @@ struct EnvSettings : Config
 
 EnvSettings envSettings;
 
-static GlobalConfig::Register rSettings(&envSettings);
+static GlobalConfig::Register rEnvSettings(&envSettings);
 
 typedef enum { srcNixExprDrvs, srcNixExprs, srcStorePaths, srcProfile, srcAttrPath, srcUnknown } InstallSourceType;
 
@@ -74,7 +74,7 @@ struct InstallSourceInfo
 {
     InstallSourceType type;
     std::shared_ptr<SourcePath> nixExprPath; /* for srcNixExprDrvs, srcNixExprs */
-    Path profile;                            /* for srcProfile */
+    std::filesystem::path profile;           /* for srcProfile */
     std::string systemFilter;                /* for srcNixExprDrvs */
     Bindings * autoArgs;
 };
@@ -82,7 +82,7 @@ struct InstallSourceInfo
 struct Globals
 {
     InstallSourceInfo instSource;
-    Path profile;
+    std::filesystem::path profile;
     std::shared_ptr<EvalState> state;
     bool dryRun;
     bool preserveInstalled;
@@ -457,7 +457,7 @@ static void queryInstSources(
 
             if (path.isDerivation()) {
                 elem.setDrvPath(path);
-                auto outputs = state.store->queryDerivationOutputMap(path);
+                auto outputs = deepQueryDerivationOutputMap(*state.store, path);
                 elem.setOutPath(outputs.at("out"));
                 if (name.size() >= drvExtension.size()
                     && std::string(name, name.size() - drvExtension.size()) == drvExtension)
@@ -522,8 +522,8 @@ static void setMetaFlag(EvalState & state, PackageInfo & drv, const std::string 
     drv.setMeta(name, v);
 }
 
-static void
-installDerivations(Globals & globals, const Strings & args, const Path & profile, std::optional<int> priority)
+static void installDerivations(
+    Globals & globals, const Strings & args, const std::filesystem::path & profile, std::optional<int> priority)
 {
     debug("installing derivations");
 
@@ -800,7 +800,7 @@ static void opSet(Globals & globals, Strings opFlags, Strings opArgs)
     switchLink(globals.profile, generation);
 }
 
-static void uninstallDerivations(Globals & globals, Strings & selectors, Path & profile)
+static void uninstallDerivations(Globals & globals, Strings & selectors, const std::filesystem::path & profile)
 {
     while (true) {
         auto lockToken = optimisticLockProfile(profile);
@@ -1072,7 +1072,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
     /* Print the desired columns, or XML output. */
     if (jsonOutput) {
         queryJSON(globals, elems, printOutPath, printDrvPath, printMeta);
-        cout << '\n';
+        std::cout << '\n';
         return;
     }
 
@@ -1081,7 +1081,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
 
     Table table;
     std::ostringstream dummy;
-    XMLWriter xml(true, *(xmlOutput ? &cout : &dummy));
+    XMLWriter xml(true, *(xmlOutput ? &std::cout : &dummy));
     XMLOpenElement xmlRoot(xml, "items");
 
     for (auto & i : elems) {
@@ -1273,7 +1273,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
             } else
                 table.push_back(columns);
 
-            cout.flush();
+            std::cout.flush();
 
         } catch (AssertionError & e) {
             printMsg(lvlTalkative, "skipping derivation named '%1%' which gives an assertion failure", i.queryName());
@@ -1294,7 +1294,7 @@ static void opSwitchProfile(Globals & globals, Strings opFlags, Strings opArgs)
     if (opArgs.size() != 1)
         throw UsageError("exactly one argument expected");
 
-    Path profile = absPath(opArgs.front());
+    auto profile = absPath(std::filesystem::path{opArgs.front()});
     auto profileLink = settings.useXDGBaseDirectories ? createNixStateDir() / "profile" : getHome() / ".nix-profile";
 
     switchLink(profileLink, profile);
@@ -1535,3 +1535,5 @@ static int main_nix_env(int argc, char ** argv)
 }
 
 static RegisterLegacyCommand r_nix_env("nix-env", main_nix_env);
+
+} // namespace nix

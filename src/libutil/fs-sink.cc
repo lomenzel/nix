@@ -90,7 +90,7 @@ void RestoreSink::createDirectory(const CanonPath & path, DirectoryCreatedCallba
         FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         FILE_DIRECTORY_FILE
 #else
-        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
         0
 #endif
     );
@@ -148,6 +148,16 @@ struct RestoreRegularFile : CreateRegularFileSink, FdSink
 
     ~RestoreRegularFile()
     {
+        /* Flush the sink before FdSink destructor has a chance to run and we've
+           closed the file descriptor. */
+        if (fd) {
+            try {
+                FdSink::flush();
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+        }
+
         /* Initiate an fsync operation without waiting for the
            result. The real fsync should be run before registering a
            store path, but this is a performance optimization to allow
@@ -160,7 +170,7 @@ struct RestoreRegularFile : CreateRegularFileSink, FdSink
     void preallocateContents(uint64_t size) override;
 };
 
-void RestoreSink::createRegularFile(const CanonPath & path, std::function<void(CreateRegularFileSink &)> func)
+void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
     auto p = append(dstPath, path);
 
@@ -234,7 +244,7 @@ void RestoreSink::createSymlink(const CanonPath & path, const std::string & targ
     nix::createSymlink(target, p.string());
 }
 
-void RegularFileSink::createRegularFile(const CanonPath & path, std::function<void(CreateRegularFileSink &)> func)
+void RegularFileSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
     struct CRF : CreateRegularFileSink
     {
@@ -256,8 +266,7 @@ void RegularFileSink::createRegularFile(const CanonPath & path, std::function<vo
     func(crf);
 }
 
-void NullFileSystemObjectSink::createRegularFile(
-    const CanonPath & path, std::function<void(CreateRegularFileSink &)> func)
+void NullFileSystemObjectSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
     struct : CreateRegularFileSink
     {

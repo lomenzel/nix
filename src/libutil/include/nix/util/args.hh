@@ -11,6 +11,7 @@
 
 #include "nix/util/types.hh"
 #include "nix/util/experimental-features.hh"
+#include "nix/util/fun.hh"
 #include "nix/util/ref.hh"
 
 namespace nix {
@@ -83,7 +84,7 @@ protected:
     struct Handler
     {
         std::function<void(std::vector<std::string>)> fun;
-        size_t arity;
+        size_t arity = 0;
 
         Handler() = default;
 
@@ -385,7 +386,7 @@ struct Command : virtual public Args
     }
 };
 
-using Commands = std::map<std::string, std::function<ref<Command>()>>;
+using Commands = std::map<std::string, fun<ref<Command>()>>;
 
 /**
  * An argument parser that supports multiple subcommands,

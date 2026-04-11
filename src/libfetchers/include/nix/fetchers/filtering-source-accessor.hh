@@ -2,7 +2,8 @@
 
 #include "nix/util/source-path.hh"
 
-#include <boost/unordered/unordered_flat_set_fwd.hpp>
+#include <set>
+#include <unordered_set>
 
 namespace nix {
 
@@ -11,7 +12,7 @@ namespace nix {
  * `RestrictedPathError` explaining that access to `path` is
  * forbidden.
  */
-typedef std::function<RestrictedPathError(const CanonPath & path)> MakeNotAllowedError;
+typedef fun<RestrictedPathError(const CanonPath & path)> MakeNotAllowedError;
 
 /**
  * An abstract wrapping `SourceAccessor` that performs access
@@ -36,7 +37,7 @@ struct FilteringSourceAccessor : SourceAccessor
 
     using SourceAccessor::readFile;
 
-    void readFile(const CanonPath & path, Sink & sink, std::function<void(uint64_t)> sizeCallback) override;
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
 
     bool pathExists(const CanonPath & path) override;
 
@@ -79,8 +80,8 @@ struct AllowListSourceAccessor : public FilteringSourceAccessor
 
     static ref<AllowListSourceAccessor> create(
         ref<SourceAccessor> next,
-        std::set<CanonPath> && allowedPrefixes,
-        boost::unordered_flat_set<CanonPath> && allowedPaths,
+        const std::set<CanonPath> & allowedPrefixes,
+        const std::unordered_set<CanonPath> & allowedPaths,
         MakeNotAllowedError && makeNotAllowedError);
 
     using FilteringSourceAccessor::FilteringSourceAccessor;

@@ -53,7 +53,7 @@ struct RestrictedStore : public virtual IndirectRootStore, public virtual GcStor
     {
     }
 
-    Path getRealStoreDir() override
+    std::filesystem::path getRealStoreDir() override
     {
         return next->config->realStoreDir;
     }
@@ -125,7 +125,7 @@ struct RestrictedStore : public virtual IndirectRootStore, public virtual GcStor
 
     void addTempRoot(const StorePath & path) override {}
 
-    void addIndirectRoot(const Path & path) override {}
+    void addIndirectRoot(const std::filesystem::path & path) override {}
 
     Roots findRoots(bool censor) override
     {
@@ -280,9 +280,18 @@ std::vector<KeyedBuildResult> RestrictedStore::buildPathsWithResults(
 
     for (auto & result : results) {
         if (auto * successP = result.tryGetSuccess()) {
-            for (auto & [outputName, output] : successP->builtOutputs) {
-                newPaths.insert(output.outPath);
-                newRealisations.insert(output);
+            if (auto * pathBuilt = std::get_if<DerivedPathBuilt>(&result.path)) {
+                // TODO ugly extra IO
+                auto drvPath = resolveDerivedPath(*next, *pathBuilt->drvPath);
+                for (auto & [outputName, output] : successP->builtOutputs) {
+                    newPaths.insert(output.outPath);
+                    newRealisations.insert(
+                        {output,
+                         {
+                             .drvPath = drvPath,
+                             .outputName = outputName,
+                         }});
+                }
             }
         }
     }

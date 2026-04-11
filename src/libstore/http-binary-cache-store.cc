@@ -4,8 +4,11 @@
 #include "nix/store/nar-info-disk-cache.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/callback.hh"
+#include "nix/util/closure.hh"
 #include "nix/store/store-registration.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/compression.hh"
+#include "nix/util/topo-sort.hh"
 
 namespace nix {
 
@@ -20,23 +23,13 @@ StringSet HttpBinaryCacheStoreConfig::uriSchemes()
     return ret;
 }
 
-HttpBinaryCacheStoreConfig::HttpBinaryCacheStoreConfig(
-    std::string_view scheme, std::string_view _cacheUri, const Params & params)
-    : HttpBinaryCacheStoreConfig(
-          parseURL(
-              std::string{scheme} + "://"
-              + (!_cacheUri.empty()
-                     ? _cacheUri
-                     : throw UsageError("`%s` Store requires a non-empty authority in Store URL", scheme))),
-          params)
-{
-}
-
 HttpBinaryCacheStoreConfig::HttpBinaryCacheStoreConfig(ParsedURL _cacheUri, const Params & params)
-    : StoreConfig(params)
+    : StoreConfig(params, FilePathType::Unix)
     , BinaryCacheStoreConfig(params)
     , cacheUri(std::move(_cacheUri))
 {
+    if (!uriSchemes().contains("file") && (!cacheUri.authority || cacheUri.authority->host.empty()))
+        throw UsageError("`%s` Store requires a non-empty authority in Store URL", cacheUri.scheme);
     while (!cacheUri.path.empty() && cacheUri.path.back() == "")
         cacheUri.path.pop_back();
 }
@@ -87,6 +80,46 @@ void HttpBinaryCacheStore::init()
         }
         diskCache->createCache(cacheKey, config->storeDir, config->wantMassQuery, config->priority);
     }
+}
+
+StorePaths HttpBinaryCacheStore::topoSortPaths(const StorePathSet & paths)
+{
+    std::unordered_map<StorePath, ref<const ValidPathInfo>> pathInfos;
+    StorePathSet referencesClosureSet;
+
+    /* Traverse the references closure that is also present in the starting set
+       in an asynchronous manner. */
+    computeClosure<StorePath>(
+        paths,
+        referencesClosureSet,
+        [this, &paths, &pathInfos](const StorePath & path) -> asio::awaitable<StorePathSet> {
+            StorePathSet res;
+            auto info = co_await callbackToAwaitable<ref<const ValidPathInfo>>(
+                [this, path](Callback<ref<const ValidPathInfo>> cb) { queryPathInfo(path, std::move(cb)); });
+
+            for (auto & ref : info->references)
+                /* Don't traverse into items that don't exist in our starting set. */
+                if (ref != path && paths.count(ref))
+                    res.insert(ref);
+
+            /* Fill the map. */
+            pathInfos.emplace(path, info);
+
+            co_return res;
+        });
+
+    auto result = topoSort(paths, [&](const StorePath & path) { return pathInfos.at(path)->references; });
+
+    return std::visit(
+        overloaded{
+            [&](const Cycle<StorePath> & cycle) -> StorePaths {
+                throw Error(
+                    "cycle detected in the references of '%s' from '%s'",
+                    printStorePath(cycle.path),
+                    printStorePath(cycle.parent));
+            },
+            [](const auto & sorted) { return sorted; }},
+        result);
 }
 
 std::optional<CompressionAlgo> HttpBinaryCacheStore::getCompressionMethod(const std::string & path)
@@ -170,11 +203,11 @@ void HttpBinaryCacheStore::upsertFile(
 {
     try {
         if (auto compressionMethod = getCompressionMethod(path)) {
-            CompressedSource compressed(source, *compressionMethod);
+            StringSource compressed(compress(*compressionMethod, source));
             /* TODO: Validate that this is a valid content encoding. We probably shouldn't set non-standard values here.
              */
             Headers headers = {{"Content-Encoding", showCompressionAlgo(*compressionMethod)}};
-            upload(path, compressed, compressed.size(), mimeType, std::move(headers));
+            upload(path, compressed, compressed.s.size(), mimeType, std::move(headers));
         } else {
             upload(path, source, sizeHint, mimeType, std::nullopt);
         }
@@ -221,6 +254,18 @@ FileTransferRequest HttpBinaryCacheStore::makeRequest(std::string_view path)
             request.tlsKey = *key;
         }
     }
+
+    // Propagate per-substituter retry overrides to the transfer request.
+    // Only set when the user actually specified the URL parameter; otherwise
+    // the transfer falls back to the global FileTransferSettings.
+    auto propagate = [](auto & setting, auto & dest) {
+        if (setting.isOverridden())
+            dest = setting.get();
+    };
+    propagate(config->retryDelayMs, request.retryDelayMs);
+    propagate(config->retryDelayRateLimitedMs, request.retryDelayRateLimitedMs);
+    propagate(config->retryMaxDelayMs, request.retryMaxDelayMs);
+    propagate(config->retryAttempts, request.retryAttempts);
 
     return request;
 }

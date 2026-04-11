@@ -4,6 +4,12 @@
 
 namespace nix {
 
+InvalidPathError::InvalidPathError(EvalState & state, const StorePath & path)
+    : CloneableError(state, "path '%s' is not valid", path.to_string())
+    , path{path}
+{
+}
+
 template<class T>
 EvalErrorBuilder<T> & EvalErrorBuilder<T>::withExitStatus(unsigned int exitStatus)
 {
@@ -114,5 +120,6 @@ template class EvalErrorBuilder<InfiniteRecursionError>;
 template class EvalErrorBuilder<StackOverflowError>;
 template class EvalErrorBuilder<InvalidPathError>;
 template class EvalErrorBuilder<IFDError>;
+template class EvalErrorBuilder<RecoverableEvalError>;
 
 } // namespace nix

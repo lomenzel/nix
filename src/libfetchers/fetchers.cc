@@ -1,12 +1,12 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/store-api.hh"
+#include "nix/util/fs-sink.hh"
 #include "nix/util/source-path.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/url.hh"
-#include "nix/util/archive.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -161,7 +161,7 @@ bool Input::isFinal() const
     return maybeGetBoolAttr(attrs, "__final").value_or(false);
 }
 
-std::optional<std::string> Input::isRelative() const
+std::optional<std::filesystem::path> Input::isRelative() const
 {
     assert(scheme);
     return scheme->isRelative(*this);
@@ -236,6 +236,9 @@ void Input::checkLocks(Input specified, Input & result)
         if (auto prevNarHash = specified.getNarHash())
             specified.attrs.insert_or_assign("narHash", prevNarHash->to_string(HashFormat::SRI, true));
 
+        if (auto narHash = result.getNarHash())
+            result.attrs.insert_or_assign("narHash", narHash->to_string(HashFormat::SRI, true));
+
         for (auto & field : specified.attrs) {
             auto field2 = result.attrs.find(field.first);
             if (field2 != result.attrs.end() && field.second != field2->second)
@@ -269,23 +272,9 @@ void Input::checkLocks(Input specified, Input & result)
         }
     }
 
-    if (auto prevLastModified = specified.getLastModified()) {
-        if (result.getLastModified() != prevLastModified)
-            throw Error(
-                "'lastModified' attribute mismatch in input '%s', expected %d, got %d",
-                result.to_string(),
-                *prevLastModified,
-                result.getLastModified().value_or(-1));
-    }
-
     if (auto prevRev = specified.getRev()) {
         if (result.getRev() != prevRev)
             throw Error("'rev' attribute mismatch in input '%s', expected %s", result.to_string(), prevRev->gitRev());
-    }
-
-    if (auto prevRevCount = specified.getRevCount()) {
-        if (result.getRevCount() != prevRevCount)
-            throw Error("'revCount' attribute mismatch in input '%s', expected %d", result.to_string(), *prevRevCount);
     }
 }
 

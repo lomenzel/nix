@@ -1,5 +1,4 @@
 #include "nix/store/path-references.hh"
-#include "nix/util/hash.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/canon-path.hh"
@@ -7,9 +6,6 @@
 
 #include <map>
 #include <cstdlib>
-#include <mutex>
-#include <algorithm>
-#include <functional>
 
 namespace nix {
 
@@ -47,7 +43,7 @@ StorePathSet PathRefScanSink::getResultPaths()
     return found;
 }
 
-StorePathSet scanForReferences(Sink & toTee, const Path & path, const StorePathSet & refs)
+StorePathSet scanForReferences(Sink & toTee, const std::filesystem::path & path, const StorePathSet & refs)
 {
     PathRefScanSink refsSink = PathRefScanSink::fromPaths(refs);
     TeeSink sink{refsSink, toTee};
@@ -62,7 +58,7 @@ void scanForReferencesDeep(
     SourceAccessor & accessor,
     const CanonPath & rootPath,
     const StorePathSet & refs,
-    std::function<void(FileRefScanResult)> callback)
+    fun<void(FileRefScanResult)> callback)
 {
     // Recursive tree walker
     auto walk = [&](this auto & self, const CanonPath & path) -> void {

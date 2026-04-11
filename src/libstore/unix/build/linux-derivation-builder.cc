@@ -1,5 +1,7 @@
 #ifdef __linux__
 
+#  include "store-config-private.hh"
+
 #  include "nix/store/globals.hh"
 #  include "nix/store/personality.hh"
 #  include "nix/store/filetransfer.hh"
@@ -9,6 +11,10 @@
 #  include "nix/util/serialise.hh"
 #  include "linux/fchmodat2-compat.hh"
 
+#  include <algorithm>
+#  include <string_view>
+#  include <cstdint>
+
 #  include <sys/ioctl.h>
 #  include <net/if.h>
 #  include <netinet/ip.h>
@@ -17,9 +23,14 @@
 #  include <sys/param.h>
 #  include <sys/mount.h>
 #  include <sys/syscall.h>
+#  include <sys/prctl.h>
 
 #  if HAVE_SECCOMP
 #    include <seccomp.h>
+#  endif
+
+#  if HAVE_LANDLOCK
+#    include <linux/landlock.h>
 #  endif
 
 #  define pivot_root(new_root, put_old) (syscall(SYS_pivot_root, new_root, put_old))
@@ -125,6 +136,77 @@ static void setupSeccomp(const LocalSettings & localSettings)
 #  endif
 }
 
+#  if HAVE_LANDLOCK && defined(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET)
+
+#    define DO_LANDLOCK 1
+
+/* We are using LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET on best-effort basis. There are no glibc wrappers for now. */
+
+static int landlockCreateRuleset(const ::landlock_ruleset_attr * attr, std::size_t size, std::uint32_t flags)
+{
+    return ::syscall(__NR_landlock_create_ruleset, attr, size, flags);
+}
+
+static int landlockRestrictSelf(Descriptor rulesetFd, std::uint32_t flags)
+{
+    return ::syscall(__NR_landlock_restrict_self, rulesetFd, flags);
+}
+
+static int getLandlockAbiVersion()
+{
+    int abiVersion = landlockCreateRuleset(nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    return abiVersion;
+}
+
+static void setupLandlock()
+{
+    bool landlockSupportsScopeAbstractUnixSocket = []() {
+        int abiVersion = getLandlockAbiVersion();
+        if (abiVersion >= 6)
+            /* All good, we can use LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET. See
+               https://docs.kernel.org/userspace-api/landlock.html#abstract-unix-socket-abi-6 */
+            return true;
+
+        if (abiVersion == -1) {
+            debug("landlock is not available");
+            return false;
+        }
+
+        debug("landlock version %d does not support LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET", abiVersion);
+        return false;
+    }();
+
+    /* Bail out early if landlock is not enabled or LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET wouldn't work.
+       TODO: Consider adding more landlock rules for filesystem access as defense-in-depth on top. */
+    if (!landlockSupportsScopeAbstractUnixSocket)
+        return;
+
+    ::landlock_ruleset_attr attr = {
+        /* This prevents multiple FODs from communicating with each other
+           via abstract sockets. Note that cooperating processes outside the
+           sandbox can still connect to an abstract socket created by the FOD. To
+           mitigate that issue entirely we'd still need network namespaces. */
+        .scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+    };
+
+    /* This better not fail - if the kernel reports a new enough ABI version we
+       should treat any errors as fatal from now on. */
+    AutoCloseFD rulesetFd = landlockCreateRuleset(&attr, sizeof(attr), 0);
+    if (!rulesetFd)
+        throw SysError("failed to create a landlock ruleset");
+
+    if (landlockRestrictSelf(rulesetFd.get(), 0) == -1)
+        throw SysError("failed to apply landlock");
+
+    debug("applied landlock sandboxing");
+}
+
+#  else
+
+#    define DO_LANDLOCK 0
+
+#  endif
+
 static void doBind(const std::filesystem::path & source, const std::filesystem::path & target, bool optional = false)
 {
     debug("bind mounting %1% to %2%", PathFmt(source), PathFmt(target));
@@ -165,7 +247,26 @@ struct LinuxDerivationBuilder : virtual DerivationBuilderImpl
     {
         auto & localSettings = store.config->getLocalSettings();
 
+        /* Set the NO_NEW_PRIVS before doing seccomp/landlock setup.
+           landlock_restrict_self requires either NO_NEW_PRIVS or CAP_SYS_ADMIN.
+           With user namespaces we do get CAP_SYS_ADMIN. */
+        if (!localSettings.allowNewPrivileges)
+            if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1)
+                throw SysError("failed to set PR_SET_NO_NEW_PRIVS");
+
         setupSeccomp(localSettings);
+
+#  if DO_LANDLOCK
+        try {
+            setupLandlock();
+        } catch (SysError & e) {
+            if (e.errNo != EPERM)
+                throw;
+            /* If allowNewPrivileges is true and we don't have CAP_SYS_ADMIN
+               this code path might be hit. */
+            warn("setting up landlock: %s", e.message());
+        }
+#  endif
 
         linux::setPersonality({
             .system = drv.platform,
@@ -234,10 +335,10 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             /* If we're running from the daemon, then this will return the
                root cgroup of the service. Otherwise, it will return the
                current cgroup. */
-            auto cgroupFS = getCgroupFS();
+            auto cgroupFS = linux::getCgroupFS();
             if (!cgroupFS)
                 throw Error("cannot determine the cgroups file system");
-            auto rootCgroupPath = *cgroupFS / getRootCgroup().rel();
+            auto rootCgroupPath = *cgroupFS / linux::getRootCgroup().rel();
             if (!pathExists(rootCgroupPath))
                 throw Error("expected cgroup directory %s", PathFmt(rootCgroupPath));
 
@@ -260,7 +361,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
                 if (pathExists(cgroupFile)) {
                     auto prevCgroup = readFile(cgroupFile);
-                    destroyCgroup(prevCgroup);
+                    linux::destroyCgroup(prevCgroup);
                 }
 
                 writeFile(cgroupFile, cgroup->native());
@@ -372,10 +473,10 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
         sendPid.writeSide.close();
 
-        if (helper.wait() != 0) {
+        if (auto status = helper.wait(); !statusOk(status)) {
             processSandboxSetupMessages();
             // Only reached if the child process didn't send an exception.
-            throw Error("unable to start build process");
+            throw Error("unable to start build process: %s", statusToString(status));
         }
 
         userNamespaceSync.readSide = -1;
@@ -423,8 +524,8 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
                     "cannot perform a sandboxed build because user namespaces are not enabled; check /proc/sys/user/max_user_namespaces");
         }
 
-        /* Now that we now the sandbox uid, we can write
-           /etc/passwd. */
+        /* Now that we know the sandbox uid/gid, we can write
+           /etc/passwd and /etc/group. */
         writeFile(
             chrootRootDir / "etc" / "passwd",
             fmt("root:x:0:0:Nix build user:%3%:/noshell\n"
@@ -432,7 +533,14 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
                 "nobody:x:65534:65534:Nobody:/:/noshell\n",
                 sandboxUid(),
                 sandboxGid(),
-                store.config->getLocalSettings().sandboxBuildDir));
+                store.config->getLocalSettings().sandboxBuildDir.get().native()));
+
+        writeFile(
+            chrootRootDir / "etc" / "group",
+            fmt("root:x:0:\n"
+                "nixbld:!:%1%:\n"
+                "nogroup:x:65534:\n",
+                sandboxGid()));
 
         /* Save the mount- and user namespace of the child. We have to do this
          *before* the child does a chroot. */
@@ -472,8 +580,9 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             if (!fd)
                 throw SysError("cannot open IP socket");
 
-            struct ifreq ifr;
-            strcpy(ifr.ifr_name, "lo");
+            using namespace std::string_view_literals;
+            struct ifreq ifr = {};
+            std::ranges::copy("lo"sv, ifr.ifr_name);
             ifr.ifr_flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
             if (ioctl(fd.get(), SIOCSIFFLAGS, &ifr) == -1)
                 throw SysError("cannot set loopback interface flags");
@@ -714,7 +823,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
     void killSandbox(bool getStats) override
     {
         if (cgroup) {
-            auto stats = destroyCgroup(*cgroup);
+            auto stats = linux::destroyCgroup(*cgroup);
             if (getStats) {
                 buildResult.cpuUser = stats.cpuUser;
                 buildResult.cpuSystem = stats.cpuSystem;
@@ -746,11 +855,13 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
         }));
 
         int status = child.wait();
-        if (status != 0)
-            throw Error("could not add path '%s' to sandbox", store.printStorePath(path));
+        if (!statusOk(status))
+            throw Error("could not add path '%s' to sandbox: %s", store.printStorePath(path), statusToString(status));
     }
 };
 
 } // namespace nix
+
+#  undef DO_LANDLOCK
 
 #endif

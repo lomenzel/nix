@@ -16,7 +16,10 @@ class RemoteFSAccessor;
 
 struct BinaryCacheStoreConfig : virtual StoreConfig
 {
-    using StoreConfig::StoreConfig;
+    BinaryCacheStoreConfig(const Params & params)
+        : StoreConfig(params, FilePathType::Unix)
+    {
+    }
 
     Setting<CompressionAlgo> compression{
         this,
@@ -39,12 +42,13 @@ struct BinaryCacheStoreConfig : virtual StoreConfig
           fetch debug info on demand
         )"};
 
-    Setting<Path> secretKeyFile{this, "", "secret-key", "Path to the secret key used to sign the binary cache."};
+    Setting<std::optional<AbsolutePath>> secretKeyFile{
+        this, std::nullopt, "secret-key", "Path to the secret key used to sign the binary cache."};
 
     Setting<std::string> secretKeyFiles{
         this, "", "secret-keys", "List of comma-separated paths to the secret keys used to sign the binary cache."};
 
-    Setting<std::optional<std::filesystem::path>> localNarCache{
+    Setting<std::optional<AbsolutePath>> localNarCache{
         this,
         std::nullopt,
         "local-nar-cache",
@@ -90,8 +94,18 @@ protected:
 
     /**
      * The prefix under which realisation infos will be stored
+     *
+     * @note The previous (still experimental, though) hash-keyed
+     * realisations were under "realisations". "build trace" is a better
+     * name anyways (issue #11895). This is call "v2" accordingly.
+     *
+     * While we're experimenting, we'll freely increase this version
+     * number. Old build traces will just be "abandoned" at the old URL.
+     * When we are done experimenting, we'll try lean more on versioning
+     * the build trace entries themselves than the entire directory, for
+     * a smoother migration path.
      */
-    constexpr const static std::string realisationsPrefix = "realisations";
+    constexpr const static std::string realisationsPrefix = "build-trace-v2";
 
     constexpr const static std::string cacheInfoFile = "nix-cache-info";
 
@@ -100,7 +114,7 @@ protected:
     /**
      * Compute the path to the given realisation
      *
-     * It's `${realisationsPrefix}/${drvOutput}.doi`.
+     * It's `${realisationsPrefix}/${drvPath}/${outputName}`.
      */
     std::string makeRealisationPath(const DrvOutput & id);
 
@@ -160,10 +174,7 @@ private:
     void writeNarInfo(ref<NarInfo> narInfo);
 
     ref<const ValidPathInfo> addToStoreCommon(
-        Source & narSource,
-        RepairFlag repair,
-        CheckSigsFlag checkSigs,
-        std::function<ValidPathInfo(HashResult)> mkInfo);
+        Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo);
 
     /**
      * Same as `getFSAccessor`, but with a more preceise return type.

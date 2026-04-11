@@ -16,6 +16,16 @@ in
 scope: {
   inherit stdenv;
 
+  mimalloc = pkgs.mimalloc.overrideAttrs rec {
+    version = "3.1.6";
+    src = pkgs.fetchFromGitHub {
+      owner = "microsoft";
+      repo = "mimalloc";
+      tag = "v${version}";
+      hash = "sha256-7zG0Sqloanz/b+fkJ4wzO86uBmtf9fdYNAT9ixLouyY=";
+    };
+  };
+
   boehmgc =
     (pkgs.boehmgc.override {
       enableLargeConfig = true;
@@ -30,9 +40,19 @@ scope: {
         NIX_CFLAGS_COMPILE = "-DINITIAL_MARK_STACK_SIZE=1048576";
       });
 
-  curl = pkgs.curl.override {
-    http3Support = !pkgs.stdenv.hostPlatform.isWindows;
-  };
+  curl =
+    (pkgs.curl.override {
+      http3Support = !pkgs.stdenv.hostPlatform.isWindows;
+      # Make sure we enable all the dependencies for Content-Encoding/Transfer-Encoding decompression.
+      zstdSupport = true;
+      brotliSupport = true;
+      zlibSupport = true;
+    }).overrideAttrs
+      {
+        # TODO: Fix in nixpkgs. Static build with brotli is marked as broken, but it's not the case.
+        # Remove once https://github.com/NixOS/nixpkgs/pull/494111 lands in the 25.11 channel.
+        meta.broken = false;
+      };
 
   libblake3 = pkgs.libblake3.override {
     useTBB = !(stdenv.hostPlatform.isWindows || stdenv.hostPlatform.isStatic);

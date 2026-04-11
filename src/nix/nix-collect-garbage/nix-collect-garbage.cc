@@ -10,14 +10,9 @@
 #include "nix/cmd/legacy.hh"
 #include "man-pages.hh"
 
-#include <iostream>
 #include <cerrno>
 
-namespace nix::fs {
-using namespace std::filesystem;
-}
-
-using namespace nix;
+namespace nix {
 
 std::string deleteOlderThan;
 bool dryRun = false;
@@ -42,7 +37,7 @@ void removeOldGenerations(std::filesystem::path dir)
         if (type == std::filesystem::file_type::symlink && canWrite) {
             std::string link;
             try {
-                link = readLink(path);
+                link = readLink(path).string();
             } catch (SystemError & e) {
                 if (e.is(std::errc::no_such_file_or_directory))
                     continue;
@@ -105,6 +100,7 @@ static int main_nix_collect_garbage(int argc, char ** argv)
         auto store = openStore();
         auto & gcStore = require<GcStore>(*store);
         options.action = dryRun ? GCOptions::gcReturnDead : GCOptions::gcDeleteDead;
+        options.pathsToDelete = GCOptions::WholeStore{};
         GCResults results;
         Finally printer([&] { printFreed(dryRun, results); });
         gcStore.collectGarbage(options, results);
@@ -114,3 +110,5 @@ static int main_nix_collect_garbage(int argc, char ** argv)
 }
 
 static RegisterLegacyCommand r_nix_collect_garbage("nix-collect-garbage", main_nix_collect_garbage);
+
+} // namespace nix
