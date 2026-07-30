@@ -57,7 +57,7 @@ openNewFileForWrite(const std::filesystem::path & path, [[maybe_unused]] mode_t 
 {
     return AutoCloseFD{CreateFileW(
         path.c_str(),
-        GENERIC_WRITE,
+        GENERIC_WRITE | (params.writeOnly ? 0 : GENERIC_READ),
         FILE_SHARE_READ | FILE_SHARE_DELETE,
         /*lpSecurityAttributes=*/nullptr,
         params.truncateExisting ? CREATE_ALWAYS : CREATE_NEW, /* TODO: Reparse points. */
@@ -77,7 +77,7 @@ std::filesystem::path defaultTempDir()
 void deletePath(const std::filesystem::path & path)
 {
     std::error_code ec;
-    std::filesystem::remove_all(path, ec);
+    std::filesystem::remove_all(path, ec); // NOLINT(bugprone-unsafe-functions)
     if (ec && ec != std::errc::no_such_file_or_directory)
         throw SysError(ec.default_error_condition().value(), "recursively deleting %1%", PathFmt(path));
 }

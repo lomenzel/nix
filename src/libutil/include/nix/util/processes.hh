@@ -97,7 +97,6 @@ struct ProcessOptions
     std::string errorPrefix = "";
     bool dieWithParent = true;
     bool runExitHandlers = false;
-    bool allowVfork = false;
     /**
      * use clone() with the specified flags (Linux only)
      */
@@ -116,7 +115,6 @@ std::string runProgram(
     std::filesystem::path program,
     bool lookupPath = false,
     const OsStrings & args = OsStrings(),
-    const std::optional<std::string> & input = {},
     bool isInteractive = false);
 
 struct RunOptions
@@ -125,24 +123,26 @@ struct RunOptions
     bool lookupPath = true;
     OsStrings args;
 #ifndef _WIN32
+    std::optional<std::string> argv0;
     std::optional<uid_t> uid;
     std::optional<uid_t> gid;
 #endif
     std::optional<std::filesystem::path> chdir;
     std::optional<OsStringMap> environment;
-    std::optional<std::string> input;
-    Source * standardIn = nullptr;
     Sink * standardOut = nullptr;
     bool mergeStderrToStdout = false;
     bool isInteractive = false;
 };
 
+// Output = error code + "standard out" output stream
 std::pair<int, std::string> runProgram(RunOptions && options);
 
 void runProgram2(const RunOptions & options);
 
 class ExecError final : public CloneableError<ExecError, Error>
 {
+    void anchor() override;
+
 public:
     int status;
 

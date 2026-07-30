@@ -14,6 +14,8 @@
 
 namespace nix {
 
+void LoggerSettings::anchor() {}
+
 LoggerSettings loggerSettings;
 
 static GlobalConfig::Register rLoggerSettings(&loggerSettings);
@@ -30,9 +32,15 @@ void setCurActivity(const ActivityId activityId)
     curActivity = activityId;
 }
 
-std::unique_ptr<Logger> logger = makeSimpleLogger(true);
+/**
+ * This is a raw pointer to allow it to leak.
+ * Avoids races in activity teardown.
+ */
+Logger * logger = makeSimpleLogger(true).release();
 
-void Logger::warn(const std::string & msg)
+Logger::~Logger() {}
+
+void Logger::warn(const std::string & msg) noexcept
 {
     log(lvlWarn, ANSI_WARNING "warning:" ANSI_NORMAL " " + msg);
 }
@@ -57,6 +65,8 @@ std::optional<Logger::Suspension> Logger::suspendIf(bool cond)
     return {};
 }
 
+namespace {
+
 class SimpleLogger : public Logger
 {
 public:
@@ -76,7 +86,7 @@ public:
         return printBuildLogs;
     }
 
-    void log(Verbosity lvl, std::string_view s) override
+    void log(Verbosity lvl, std::string_view s) noexcept override
     {
         if (lvl > verbosity)
             return;
@@ -114,7 +124,7 @@ public:
         writeToStderr(prefix + filterANSIEscapes(s, !tty) + "\n");
     }
 
-    void logEI(const ErrorInfo & ei) override
+    void logEI(const ErrorInfo & ei) noexcept override
     {
         std::ostringstream oss;
         showErrorInfo(oss, ei, loggerSettings.showTrace.get());
@@ -128,13 +138,13 @@ public:
         ActivityType type,
         const std::string & s,
         const Fields & fields,
-        ActivityId parent) override
+        ActivityId parent) noexcept override
     {
         if (lvl <= verbosity && !s.empty())
             log(lvl, s + "...");
     }
 
-    void result(ActivityId act, ResultType type, const Fields & fields) override
+    void result(ActivityId act, ResultType type, const Fields & fields) noexcept override
     {
         if (type == resBuildLogLine && printBuildLogs) {
             auto lastLine = fields[0].s;
@@ -146,9 +156,11 @@ public:
     }
 };
 
+} // namespace
+
 Verbosity verbosity = lvlInfo;
 
-static void writeFullLogging(Descriptor fd, std::string_view s)
+static void writeFullLogging(Descriptor fd, std::string_view s) noexcept
 {
     try {
         writeFull(fd, s, false);
@@ -160,7 +172,7 @@ static void writeFullLogging(Descriptor fd, std::string_view s)
     }
 }
 
-void writeToStderr(std::string_view s)
+void writeToStderr(std::string_view s) noexcept
 {
     writeFullLogging(getStandardError(), s);
 }
@@ -208,6 +220,8 @@ void to_json(nlohmann::json & json, std::shared_ptr<const Pos> pos)
         json["file"] = nullptr;
     }
 }
+
+namespace {
 
 struct JSONLogger : Logger
 {
@@ -267,7 +281,7 @@ struct JSONLogger : Logger
         }
     }
 
-    void log(Verbosity lvl, std::string_view s) override
+    void log(Verbosity lvl, std::string_view s) noexcept override
     {
         nlohmann::json json;
         json["action"] = "msg";
@@ -276,7 +290,7 @@ struct JSONLogger : Logger
         write(json);
     }
 
-    void logEI(const ErrorInfo & ei) override
+    void logEI(const ErrorInfo & ei) noexcept override
     {
         std::ostringstream oss;
         showErrorInfo(oss, ei, loggerSettings.showTrace.get());
@@ -309,7 +323,7 @@ struct JSONLogger : Logger
         ActivityType type,
         const std::string & s,
         const Fields & fields,
-        ActivityId parent) override
+        ActivityId parent) noexcept override
     {
         nlohmann::json json;
         json["action"] = "start";
@@ -322,7 +336,7 @@ struct JSONLogger : Logger
         write(json);
     }
 
-    void stopActivity(ActivityId act) override
+    void stopActivity(ActivityId act) noexcept override
     {
         nlohmann::json json;
         json["action"] = "stop";
@@ -330,7 +344,7 @@ struct JSONLogger : Logger
         write(json);
     }
 
-    void result(ActivityId act, ResultType type, const Fields & fields) override
+    void result(ActivityId act, ResultType type, const Fields & fields) noexcept override
     {
         nlohmann::json json;
         json["action"] = "result";
@@ -340,6 +354,8 @@ struct JSONLogger : Logger
         write(json);
     }
 };
+
+} // namespace
 
 std::unique_ptr<Logger> makeJSONLogger(Descriptor fd, bool includeNixPrefix)
 {
@@ -359,9 +375,15 @@ std::unique_ptr<Logger> makeJSONLogger(const std::filesystem::path & path, bool 
         }
     };
 
-    AutoCloseFD fd = std::filesystem::is_socket(path)
-                         ? connect(path)
-                         : toDescriptor(open(path.string().c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644));
+    AutoCloseFD fd = std::filesystem::is_socket(path) ? connect(path)
+                                                      : toDescriptor(open(
+                                                            path.string().c_str(),
+                                                            O_CREAT | O_APPEND | O_WRONLY
+#ifndef _WIN32
+                                                                | O_CLOEXEC
+#endif
+                                                            ,
+                                                            0644));
     if (!fd)
         throw SysError("opening log file %1%", PathFmt(path));
 
@@ -375,7 +397,7 @@ void applyJSONLogger()
             std::vector<std::unique_ptr<Logger>> loggers;
             loggers.push_back(makeJSONLogger(*opt, false));
             try {
-                logger = makeTeeLogger(std::move(logger), std::move(loggers));
+                logger = makeTeeLogger(std::unique_ptr<Logger>(logger), std::move(loggers)).release();
             } catch (...) {
                 // `logger` is now gone so give up.
                 abort();

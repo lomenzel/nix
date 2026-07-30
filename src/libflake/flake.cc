@@ -38,6 +38,7 @@
 #include "nix/fetchers/input-cache.hh"
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
+#include "nix/expr/fetch-tree.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
@@ -391,14 +392,9 @@ static Flake getFlake(
         lockedRef = FlakeRef(std::move(cachedInput2.lockedInput), newLockedRef.subdir);
     }
 
+    auto rootDir = state.storePath(state.mountInput(lockedRef.input, originalRef.input, cachedInput.accessor));
     // Re-parse flake.nix from the store.
-    return readFlake(
-        state,
-        originalRef,
-        resolvedRef,
-        lockedRef,
-        state.storePath(state.mountInput(lockedRef.input, originalRef.input, cachedInput.accessor)),
-        lockRootAttrPath);
+    return readFlake(state, originalRef, resolvedRef, lockedRef, rootDir, lockRootAttrPath);
 }
 
 Flake getFlake(EvalState & state, const FlakeRef & originalRef, fetchers::UseRegistries useRegistries)
@@ -412,18 +408,14 @@ static LockFile readLockFile(const fetchers::Settings & fetchSettings, const Sou
                                      : LockFile();
 }
 
-/* Compute an in-memory lock file for the specified top-level flake,
-   and optionally write it to file, if the flake is writable. */
-LockedFlake
-lockFlake(const Settings & settings, EvalState & state, const FlakeRef & topRef, const LockFlags & lockFlags)
+LockedFlake lockFlake(
+    const Settings & settings, EvalState & state, const FlakeRef & topRef, const LockFlags & lockFlags, Flake flake)
 {
     experimentalFeatureSettings.require(Xp::Flakes);
 
     auto useRegistries = lockFlags.useRegistries.value_or(settings.useRegistries);
     auto useRegistriesTop = useRegistries ? fetchers::UseRegistries::All : fetchers::UseRegistries::No;
     auto useRegistriesInputs = useRegistries ? fetchers::UseRegistries::Limited : fetchers::UseRegistries::No;
-
-    auto flake = getFlake(state, topRef, useRegistriesTop, {});
 
     if (lockFlags.applyNixConfig) {
         flake.config.apply(settings);
@@ -872,8 +864,6 @@ lockFlake(const Settings & settings, EvalState & state, const FlakeRef & topRef,
                                 CanonPath((topRef.subdir == "" ? "" : topRef.subdir + "/") + "flake.lock"),
                                 newLockFileS,
                                 commitMessage);
-
-                            flake.lockFilePath().invalidateCache();
                         }
 
                         /* Rewriting the lockfile changed the top-level
@@ -904,14 +894,31 @@ lockFlake(const Settings & settings, EvalState & state, const FlakeRef & topRef,
     }
 }
 
+LockedFlake
+lockFlake(const Settings & settings, EvalState & state, const FlakeRef & topRef, const LockFlags & lockFlags)
+{
+    auto useRegistries = lockFlags.useRegistries.value_or(settings.useRegistries);
+    auto useRegistriesTop = useRegistries ? fetchers::UseRegistries::All : fetchers::UseRegistries::No;
+    return lockFlake(settings, state, topRef, lockFlags, getFlake(state, topRef, useRegistriesTop, {}));
+}
+
+LockedFlake
+lockFlake(const Settings & settings, EvalState & state, const SourcePath & flakeDir, const LockFlags & lockFlags)
+{
+    /* We need a fake flakeref to put in the `Flake` struct, but it's not used for anything. */
+    auto fakeRef = parseFlakeRef(state.fetchSettings, "flake:get-flake");
+    return lockFlake(settings, state, fakeRef, lockFlags, readFlake(state, fakeRef, fakeRef, fakeRef, flakeDir, {}));
+}
+
 static ref<SourceAccessor> makeInternalFS()
 {
     auto internalFS = make_ref<MemorySourceAccessor>(MemorySourceAccessor{});
     internalFS->setPathDisplay("«flakes-internal»", "");
     internalFS->addFile(
         CanonPath("call-flake.nix"),
-#include "call-flake.nix.gen.hh" // IWYU pragma: keep
-    );
+        {
+#embed "call-flake.nix"
+        });
     return internalFS;
 }
 
@@ -968,8 +975,7 @@ void callFlake(EvalState & state, const LockedFlake & lockedFlake, Value & vRes)
     auto vFetchFinalTree = get(state.internalPrimOps, "fetchFinalTree");
     assert(vFetchFinalTree);
 
-    Value * args[] = {vLocks, &vOverrides, *vFetchFinalTree};
-    state.callFunction(*vCallFlake, args, vRes, noPos);
+    state.callFunction(*vCallFlake, std::to_array({vLocks, &vOverrides, *vFetchFinalTree}), vRes, noPos);
 }
 
 std::optional<Fingerprint> LockedFlake::getFingerprint(Store & store, const fetchers::Settings & fetchSettings) const
@@ -983,11 +989,24 @@ std::optional<Fingerprint> LockedFlake::getFingerprint(Store & store, const fetc
 
     *fingerprint += fmt(";%s;%s", flake.lockedRef.subdir, lockFile);
 
-    /* Include revCount and lastModified because they're not
-       necessarily implied by the content fingerprint (e.g. for
-       tarball flakes) but can influence the evaluation result. */
-    if (auto revCount = flake.lockedRef.input.getRevCount())
-        *fingerprint += fmt(";revCount=%d", *revCount);
+    if (auto revCount = get(flake.lockedRef.input.attrs, "revCount")) {
+        if (std::get_if<fetchers::LazyAttr>(revCount)) {
+            /* A lazy revCount is computed by the fetcher, so its
+               value is functionally determined by `rev`. We only
+               need to record its presence, not force its value.
+
+               This means a lazy and a concrete revCount that would
+               resolve to the same value produce different
+               fingerprints, sacrificing some cache hits to avoid
+               the cost of forcing. */
+            *fingerprint += ";hasRevCount";
+        } else if (auto n = flake.lockedRef.input.getRevCount()) {
+            /* A concrete revCount comes from a lockfile or explicit
+               user input. The fetcher passes it through as-is, so
+               it can affect evaluation and must be fingerprinted. */
+            *fingerprint += fmt(";revCount=%d", *n);
+        }
+    }
     if (auto lastModified = flake.lockedRef.input.getLastModified())
         *fingerprint += fmt(";lastModified=%d", *lastModified);
 

@@ -14,7 +14,6 @@
 #include <future>
 #include <iostream>
 #include <atomic>
-using namespace std::chrono_literals;
 
 #include <grp.h>
 #include <sys/types.h>
@@ -50,11 +49,13 @@ Pid::Pid(pid_t pid)
 }
 
 Pid::~Pid()
-try {
-    if (pid != -1)
-        kill(/*allowInterrupts=*/false);
-} catch (...) {
-    ignoreExceptionInDestructor();
+{
+    try {
+        if (pid != -1)
+            kill(/*allowInterrupts=*/false);
+    } catch (...) {
+        ignoreExceptionInDestructor();
+    }
 }
 
 void Pid::operator=(pid_t pid)
@@ -77,6 +78,8 @@ int Pid::kill(bool allowInterrupts)
     debug("killing process %1%", pid);
 
     std::atomic<bool> killed = false;
+
+    using namespace std::chrono_literals;
 
     if (killTimeout > 0ms && killSignal != SIGKILL)
         killThread = std::thread([&]() {
@@ -205,17 +208,9 @@ void killUser(uid_t uid)
 
 using ChildWrapperFunction = fun<void()>;
 
-/* Wrapper around vfork to prevent the child process from clobbering
-   the caller's stack frame in the parent. */
-static pid_t doFork(bool allowVfork, ChildWrapperFunction & fun) __attribute__((noinline));
-
-static pid_t doFork(bool allowVfork, ChildWrapperFunction & fun)
+static pid_t doFork(ChildWrapperFunction & fun)
 {
-#ifdef __linux__
-    pid_t pid = allowVfork ? vfork() : fork();
-#else
     pid_t pid = fork();
-#endif
     if (pid != 0)
         return pid;
     fun();
@@ -233,17 +228,14 @@ static int childEntry(void * arg)
 
 pid_t startProcess(fun<void()> processMain, const ProcessOptions & options)
 {
-    auto newLogger = makeSimpleLogger();
+    auto newLogger = makeSimpleLogger().release();
     ChildWrapperFunction wrapper = [&] {
-        if (!options.allowVfork) {
-            /* Set a simple logger, while releasing (not destroying)
-               the parent logger. We don't want to run the parent
-               logger's destructor since that will crash (e.g. when
-               ~ProgressBar() tries to join a thread that doesn't
-               exist. */
-            logger.release();
-            logger = std::move(newLogger);
-        }
+        /* Set a simple logger, while leaking (not destroying)
+           the parent logger. We don't want to run the parent
+           logger's destructor since that will crash (e.g. when
+           ~ProgressBar() tries to join a thread that doesn't
+           exist. */
+        logger = newLogger;
         try {
 #ifdef __linux__
             if (options.dieWithParent && prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
@@ -283,7 +275,7 @@ pid_t startProcess(fun<void()> processMain, const ProcessOptions & options)
         throw Error("clone flags are only supported on Linux");
 #endif
     } else
-        pid = doFork(options.allowVfork, wrapper);
+        pid = doFork(wrapper);
 
     if (pid == -1)
         throw SysError("unable to fork");
@@ -291,20 +283,15 @@ pid_t startProcess(fun<void()> processMain, const ProcessOptions & options)
     return pid;
 }
 
-std::string runProgram(
-    std::filesystem::path program,
-    bool lookupPath,
-    const OsStrings & args,
-    const std::optional<std::string> & input,
-    bool isInteractive)
+std::string runProgram(std::filesystem::path program, bool lookupPath, const OsStrings & args, bool isInteractive)
 {
     auto res = runProgram(
         RunOptions{
             .program = program,
             .lookupPath = lookupPath,
             .args = args,
-            .input = input,
-            .isInteractive = isInteractive});
+            .isInteractive = isInteractive,
+        });
 
     if (!statusOk(res.first))
         throw ExecError(res.first, "program %s %s", PathFmt(program), statusToString(res.first));
@@ -312,49 +299,18 @@ std::string runProgram(
     return res.second;
 }
 
-// Output = error code + "standard out" output stream
-std::pair<int, std::string> runProgram(RunOptions && options)
-{
-    StringSink sink;
-    options.standardOut = &sink;
-
-    int status = 0;
-
-    try {
-        runProgram2(options);
-    } catch (ExecError & e) {
-        status = e.status;
-    }
-
-    return {status, std::move(sink.s)};
-}
+#ifndef __linux__
 
 void runProgram2(const RunOptions & options)
 {
     checkInterrupt();
 
-    assert(!(options.standardIn && options.input));
-
-    std::unique_ptr<Source> source_;
-    Source * source = options.standardIn;
-
-    if (options.input) {
-        source_ = std::make_unique<StringSource>(*options.input);
-        source = source_.get();
-    }
-
     /* Create a pipe. */
-    Pipe out, in;
+    Pipe out;
     if (options.standardOut)
         out.create();
-    if (source)
-        in.create();
 
     ProcessOptions processOptions;
-    // vfork implies that the environment of the main process and the fork will
-    // be shared (technically this is undefined, but in practice that's the
-    // case), so we can't use it if we alter the environment
-    processOptions.allowVfork = !options.environment;
 
     auto suspension = logger->suspendIf(options.isInteractive);
 
@@ -368,8 +324,6 @@ void runProgram2(const RunOptions & options)
             if (options.mergeStderrToStdout)
                 if (dup2(STDOUT_FILENO, STDERR_FILENO) == -1)
                     throw SysError("cannot dup stdout into stderr");
-            if (source && dup2(in.readSide.get(), STDIN_FILENO) == -1)
-                throw SysError("dupping stdin");
 
             if (options.chdir && chdir((*options.chdir).c_str()) == -1)
                 throw SysError("chdir failed");
@@ -382,7 +336,9 @@ void runProgram2(const RunOptions & options)
                 throw SysError("setuid failed");
 
             Strings args_(options.args);
-            args_.push_front(options.program.native());
+            /* Allow the caller to specify an alternative argv[0]. Useful for self-exec
+               trickery. */
+            args_.push_front(options.argv0.value_or(options.program.native()));
 
             restoreProcessContext();
 
@@ -399,50 +355,16 @@ void runProgram2(const RunOptions & options)
 
     out.writeSide.close();
 
-    std::thread writerThread;
-
-    std::promise<void> promise;
-
-    Finally doJoin([&] {
-        if (writerThread.joinable())
-            writerThread.join();
-    });
-
-    if (source) {
-        in.readSide.close();
-        writerThread = std::thread([&] {
-            try {
-                std::vector<char> buf(8 * 1024);
-                while (true) {
-                    size_t n;
-                    try {
-                        n = source->read(buf.data(), buf.size());
-                    } catch (EndOfFile &) {
-                        break;
-                    }
-                    writeFull(in.writeSide.get(), {buf.data(), n});
-                }
-                promise.set_value();
-            } catch (...) {
-                promise.set_exception(std::current_exception());
-            }
-            in.writeSide.close();
-        });
-    }
-
     if (options.standardOut)
         drainFD(out.readSide.get(), *options.standardOut);
 
     /* Wait for the child to finish. */
     int status = pid.wait();
-
-    /* Wait for the writer thread to finish. */
-    if (source)
-        promise.get_future().get();
-
     if (status)
         throw ExecError(status, "program %1% %2%", PathFmt(options.program), statusToString(status));
 }
+
+#endif // __linux__
 
 //////////////////////////////////////////////////////////////////////
 

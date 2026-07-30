@@ -8,7 +8,7 @@ project(
     'warning_level=1',
     'errorlogs=true', # Please print logs for tests that fail
   ],
-  meson_version : '>= 1.1',
+  meson_version : '>= 1.8',
   license : 'LGPL-2.1-or-later',
 )
 
@@ -35,6 +35,9 @@ deps_private += gtest
 
 gmock = dependency('gmock')
 deps_private += gmock
+
+zstd = dependency('libzstd', version : '>= 1.4.0')
+deps_private += zstd
 
 if host_machine.system() == 'windows'
   # Boost.ASIO needs this unconditionally.
@@ -74,8 +77,10 @@ sources = files(
   'hash.cc',
   'hilite.cc',
   'json-utils.cc',
+  'local-keys.cc',
   'logging.cc',
   'lru-cache.cc',
+  'memo.cc',
   'memory-source-accessor.cc',
   'monitorfdhup.cc',
   'nar-listing.cc',

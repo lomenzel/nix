@@ -9,7 +9,7 @@ namespace nix {
 struct AbstractNixRepl
 {
     ref<EvalState> state;
-    Bindings * autoArgs;
+    const Bindings * autoArgs;
 
     AbstractNixRepl(ref<EvalState> state)
         : state(state)
@@ -28,7 +28,7 @@ struct AbstractNixRepl
      * @param programName Name of the command, e.g. `nix` or `nix-env`.
      * @param args arguments to the command.
      */
-    using RunNix = void(const std::string & programName, OsStrings args, const std::optional<std::string> & input);
+    using RunNix = void(const std::string & programName, OsStrings args);
 
     /**
      * @param runNix Function to run the nix CLI to support various

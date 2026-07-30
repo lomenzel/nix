@@ -79,6 +79,7 @@ public:
 
 /**
  * Function that implements a primop.
+ * FIXME: `args` should be `Value * const *` instead of `Value **`, but that would be a big tedious diff.
  */
 using PrimOpFun = void(EvalState & state, const PosIdx pos, Value ** args, Value & v);
 
@@ -226,7 +227,7 @@ struct StaticEvalSymbols
         line, column, functor, toString, right, wrong, structuredAttrs, json, allowedReferences, allowedRequisites,
         disallowedReferences, disallowedRequisites, maxSize, maxClosureSize, builder, args, contentAddressed, impure,
         outputHash, outputHashAlgo, outputHashMode, recurseForDerivations, description, self, epsilon, startSet,
-        operator_, key, path, prefix, outputSpecified;
+        operator_, key, path, prefix, outputSpecified, requiredSystemFeatures;
 
     Expr::AstSymbols exprSymbols;
 
@@ -279,6 +280,7 @@ struct StaticEvalSymbols
             .path = alloc.create("path"),
             .prefix = alloc.create("prefix"),
             .outputSpecified = alloc.create("outputSpecified"),
+            .requiredSystemFeatures = alloc.create("requiredSystemFeatures"),
             .exprSymbols = {
                 .sub = alloc.create("__sub"),
                 .lessThan = alloc.create("__lessThan"),
@@ -396,6 +398,7 @@ public:
     const ref<MemorySourceAccessor> internalFS;
 
     const SourcePath derivationInternal;
+    const SourcePath importedDrvToDerivation;
 
     /**
      * Store used to materialise .drv files.
@@ -406,8 +409,6 @@ public:
      * Store used to build stuff.
      */
     const ref<Store> buildStore;
-
-    RootValue vImportedDrvToDerivation = nullptr;
 
     const ref<fetchers::InputCache> inputCache;
 
@@ -460,10 +461,6 @@ public:
 
 private:
 
-    /* Cache for calls to addToStore(); maps source paths to the store
-       paths. */
-    const ref<boost::concurrent_flat_map<SourcePath, StorePath>> srcToStore;
-
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
@@ -489,7 +486,15 @@ private:
 
     LookupPath lookupPath;
 
-    const ref<boost::concurrent_flat_map<std::string, std::optional<SourcePath>, StringViewHash, std::equal_to<>>>
+    struct LookupPathResolvedState
+    {
+        SourcePath path;
+        const ref<boost::concurrent_flat_map<CanonPath, std::optional<SourcePath>>> resolvedPaths;
+    };
+
+    const ref<
+        boost::
+            concurrent_flat_map<std::string, std::shared_ptr<LookupPathResolvedState>, StringViewHash, std::equal_to<>>>
         lookupPathResolved;
 
     /**
@@ -626,9 +631,10 @@ public:
      *
      * If the specified search path element is a URI, download it.
      *
-     * If it is not found, return `std::nullopt`.
+     * If it is not found, return `nullptr`.
      */
-    std::optional<SourcePath> resolveLookupPathPath(const LookupPath::Path & elem, bool initAccessControl = false);
+    std::shared_ptr<LookupPathResolvedState>
+    resolveLookupPathPath(const LookupPath::Path & elem, bool initAccessControl = false);
 
     /**
      * Evaluate an expression to normal form
@@ -728,6 +734,26 @@ public:
 
     std::optional<std::string> tryAttrsToString(
         const PosIdx pos, Value & v, NixStringContext & context, bool coerceMore = false, bool copyToStore = true);
+
+    enum class CopyLazyPaths : bool {
+        PreserveLazy = false,
+        Copy = true,
+    };
+
+    /**
+     * For efficiency reasons, some store paths (as seen by the evaluator) in
+     * the storeFS at their content-addressed locations don't get copied to the
+     * store eagerly. This saves on needless I/O and possibly IPC if all the
+     * evaluator does is just evaluate nix expressions from those locations.
+     * This function copies such store objects to the store if they aren't already valid.
+     */
+    void ensureLazyPathCopied(const StorePath & path);
+
+    /**
+     * Ensure that all NixStringContextElem::Opaque context elements get fetched
+     * to the store.
+     */
+    void ensureLazyPathsCopied(const NixStringContext & context);
 
     /**
      * String coercion.
@@ -925,12 +951,11 @@ public:
 
     bool isFunctor(const Value & fun) const;
 
-    void callFunction(Value & fun, std::span<Value *> args, Value & vRes, const PosIdx pos);
+    void callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
 
     void callFunction(Value & fun, Value & arg, Value & vRes, const PosIdx pos)
     {
-        Value * args[] = {&arg};
-        callFunction(fun, args, vRes, pos);
+        callFunction(fun, std::to_array({&arg}), vRes, pos);
     }
 
     /**
@@ -1035,9 +1060,14 @@ public:
 
     /**
      * Coerce `v` to a path and realise it, i.e. build anything in the value's string context using `realiseContext()`.
+     * @param copyLazyPaths When encountering a lazy path (i.e. a string with Opaque context that's also "mounted" on
+     * the storeFS), fetch the store path to the store.
      */
     SourcePath realisePath(
-        const PosIdx pos, Value & v, std::optional<SymlinkResolution> resolveSymlinks = SymlinkResolution::Full);
+        const PosIdx pos,
+        Value & v,
+        std::optional<SymlinkResolution> resolveSymlinks = SymlinkResolution::Full,
+        CopyLazyPaths copyLazyPaths = CopyLazyPaths::PreserveLazy);
 
     /**
      * Realise the given string with context, and return the string with outputs instead of downstream output
