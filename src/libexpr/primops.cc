@@ -4363,6 +4363,7 @@ static RegisterPrimOp primop_reify({
       }`.
     )",
     .impl = prim_reify,
+    .experimentalFeature = Xp::AstIntrospection,
 });
 
 static void prim_sameFunction(EvalState & state, const PosIdx pos, Value ** args, Value & v)
@@ -4389,6 +4390,7 @@ static RegisterPrimOp primop_sameFunction({
     .doc = R"(
     )",
     .impl = prim_sameFunction,
+    .experimentalFeature = Xp::AstIntrospection,
 });
 
 /* Filter a list using a predicate; that is, return a list containing

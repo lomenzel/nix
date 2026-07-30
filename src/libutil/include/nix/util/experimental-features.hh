@@ -17,6 +17,7 @@ namespace nix {
  * `.cc` file as well.
  */
 enum struct ExperimentalFeature {
+    AstIntrospection,
     CaDerivations,
     ImpureDerivations,
     Flakes,

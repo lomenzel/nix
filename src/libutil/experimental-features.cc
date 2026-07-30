@@ -31,6 +31,13 @@ constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
+        .tag = Xp::AstIntrospection,
+        .name = "ast-introspection",
+        .description = R"(
+            Adds builtin functions reify and sameFunction to be able to retrieve the ast of arbitrary functions as data
+        )",
+    },
+    {
         .tag = Xp::CaDerivations,
         .name = "ca-derivations",
         .description = R"(
